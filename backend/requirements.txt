@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+yfinance
+transformers
+torch
+pandas
+sqlmodel
+python-dotenv
+scikit-learn
+httpx
+httpx
