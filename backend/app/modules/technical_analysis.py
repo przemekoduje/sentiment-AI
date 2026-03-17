@@ -5,9 +5,14 @@ def get_technical_indicator(ticker: str):
     """
     Computes detailed technical indicators and formations.
     """
-    data = yf.download(ticker, period="3mo", interval="1d", progress=False)
+    try:
+        data = yf.download(ticker, period="3mo", interval="1d", progress=False)
+    except Exception as e:
+        print(f"CRITICAL ERROR downloading data for {ticker}: {e}")
+        return {"signal": "NEUTRAL", "price": 0.0, "indicators": {}, "formations": []}, 0.0
     
-    if data.empty:
+    if data is None or data.empty:
+        print(f"FAILED to download on-demand data for {ticker}. yfinance returned empty DataFrame.")
         return {"signal": "NEUTRAL", "price": 0.0, "indicators": {}, "formations": []}, 0.0
     
     if isinstance(data.columns, pd.MultiIndex):

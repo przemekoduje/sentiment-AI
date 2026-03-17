@@ -4,7 +4,7 @@ import yfinance as yf
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from .ticker_provider import TickerProvider
-from .sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_score
+from .sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_score, aggregate_local_sentiment
 from .decision_matrix import get_trading_signal
 from .insider_tracker import InsiderTracker
 from .fundamental_filter import FundamentalFilter
@@ -15,6 +15,7 @@ _matrix_cache: List[Dict] = []
 _alerts_cache: List[Dict] = []  # Added for real-time alerts
 _last_scan_time: Optional[datetime] = None
 _initial_scan_complete: bool = False
+_active_market: str = "SP500"  # Default market
 
 class LiveDiscoveryEngine:
     """
@@ -30,24 +31,33 @@ class LiveDiscoveryEngine:
     def initial_scan_complete(self) -> bool:
         return _initial_scan_complete
 
+    @property
+    def active_market(self) -> str:
+        return _active_market
+
+    def set_active_market(self, market: str):
+        global _active_market, _initial_scan_complete
+        _active_market = market
+        _initial_scan_complete = False # Force a full refresh for the new market
+
     async def bulk_tech_scan(self, tickers: List[str]) -> List[Dict]:
         """Warstwa 1: Szybki skan techniczny w trybie BULK (Sprints)."""
         try:
+            from .yf_manager import safe_download
             dt_end = datetime.now()
             dt_start = dt_end - timedelta(days=40)
             
             # yf.download is blocking, using run_in_executor
             loop = asyncio.get_event_loop()
             
-            # Bulk download all tickers at once
-            data = await loop.run_in_executor(None, lambda: yf.download(
+            # Bulk download all tickers at once, disable internal threading!
+            data = await loop.run_in_executor(None, lambda: safe_download(
                 tickers, 
-                start=dt_start.strftime("%Y-%m-%d"), 
-                end=dt_end.strftime("%Y-%m-%d"), 
+                period="3mo",
                 progress=False, 
-                auto_adjust=True,
                 interval="1d",
-                group_by='ticker'
+                group_by='ticker',
+                threads=False
             ))
 
             if data.empty:
@@ -106,8 +116,11 @@ class LiveDiscoveryEngine:
         """Asynchroniczne odświeżanie cache'u sygnałów w tle."""
         global _signal_cache, _matrix_cache, _last_scan_time, _initial_scan_complete
         
+        # Priority tickers are common across markets or tech-heavy
         priority_tickers = ["AAPL", "NVDA", "MSFT", "GOOGL", "AMD", "TSLA", "META", "BRK-B", "JNJ", "V", "WMT", "MA", "PG", "COST"]
-        base_tickers = TickerProvider.get_sp500_tickers()[:limit]
+        
+        # Fetch base tickers based on active market
+        base_tickers = TickerProvider.get_tickers_by_market(_active_market)
         
         tickers = list(dict.fromkeys(priority_tickers + base_tickers))[:limit]
         
@@ -132,6 +145,7 @@ class LiveDiscoveryEngine:
                 # Sentiment (async news)
                 news_feed = await fetch_news_sentiment(ticker)
                 sentiment = aggregate_sentiment_score(news_feed, ticker)
+                local_sentiment = await aggregate_local_sentiment(news_feed)
                 
                 # Potential score calculation for display
                 potential_score = (
@@ -140,22 +154,6 @@ class LiveDiscoveryEngine:
                     (insider_score * 0.2) +
                     (fund_data["fundamental_score"] * 0.1)
                 )
-
-                matrix_item = {
-                    "ticker": ticker,
-                    "price": t_res['price'],
-                    "sma5": t_res['sma5'],
-                    "sma20": t_res['sma20'],
-                    "rsi": t_res['base_rsi'],
-                    "sentiment_score": round(sentiment['score'], 2),
-                    "sentiment_label": sentiment['label'],
-                    "insider_score": round(insider_score, 2),
-                    "fundamental_score": round(fund_data["fundamental_score"], 2),
-                    "fundamental_grade": fund_data["fundamental_grade"],
-                    "potential": round(potential_score * 100, 1),
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                }
-                temp_matrix.append(matrix_item)
 
                 # Decision Matrix gating for final signals
                 decision = get_trading_signal(
@@ -166,7 +164,27 @@ class LiveDiscoveryEngine:
                     fundamental_score=fund_data["fundamental_score"]
                 )
 
-                if decision['decision'] == "BUY":
+                matrix_item = {
+                    "ticker": ticker,
+                    "price": t_res['price'],
+                    "sma5": t_res['sma5'],
+                    "sma20": t_res['sma20'],
+                    "rsi": t_res['base_rsi'],
+                    "sentiment_score": round(sentiment['score'], 2),
+                    "sentiment_label": sentiment['label'],
+                    "local_sentiment_score": round(local_sentiment['score'], 2),
+                    "local_sentiment_label": local_sentiment['label'],
+                    "insider_score": round(insider_score, 2),
+                    "fundamental_score": round(fund_data["fundamental_score"], 2),
+                    "fundamental_grade": fund_data["fundamental_grade"],
+                    "potential": round(potential_score * 100, 1),
+                    "decision_action": decision['action'],
+                    "decision_reasoning": decision['reasoning'],
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                }
+                temp_matrix.append(matrix_item)
+
+                if decision['action'] == "BUY":
                     final_signals.append({
                         "symbol": ticker,
                         "company": ticker,
@@ -198,6 +216,8 @@ class LiveDiscoveryEngine:
                     "details": {
                         "score": item['sentiment_score'],
                         "label": item['sentiment_label'],
+                        "decision_action": item.get('decision_action', 'HOLD'),
+                        "decision_reasoning": item.get('decision_reasoning', ''),
                         "reasoning": f"AI models detected a significant shift in news narrative. Sentiment score of {item['sentiment_score']} indicates high conviction {item['sentiment_label']} bias."
                     }
                 })
@@ -213,6 +233,8 @@ class LiveDiscoveryEngine:
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "details": {
                         "score": item['insider_score'],
+                        "decision_action": item.get('decision_action', 'HOLD'),
+                        "decision_reasoning": item.get('decision_reasoning', ''),
                         "reasoning": f"Whale activity detected. Insider confidence score is {item['insider_score']*100}%, suggesting strong internal belief in the asset's trajectory."
                     }
                 })
@@ -230,6 +252,8 @@ class LiveDiscoveryEngine:
                         "indicator": "RSI",
                         "value": item['rsi'],
                         "status": "Overbought" if item['rsi'] > 70 else "Oversold",
+                        "decision_action": item.get('decision_action', 'HOLD'),
+                        "decision_reasoning": item.get('decision_reasoning', ''),
                         "reasoning": f"Asset has reached technical extremes. RSI at {item['rsi']} suggests a potential reversal or significant volatility ahead."
                     }
                 })
@@ -245,6 +269,8 @@ class LiveDiscoveryEngine:
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
                     "details": {
                         "potential": item['potential'],
+                        "decision_action": item.get('decision_action', 'HOLD'),
+                        "decision_reasoning": item.get('decision_reasoning', ''),
                         "breakdown": {
                             "technical": "BULLISH" if item['sma5'] > item['sma20'] else "NEUTRAL",
                             "sentiment": item['sentiment_label'],

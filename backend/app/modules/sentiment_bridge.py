@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict
 import asyncio
 from dotenv import load_dotenv
+from .sentiment_analyzer import analyze_sentiment
 
 # Disk-based caching setup
 # Relative to this file: ../../cache/
@@ -143,6 +144,59 @@ def aggregate_sentiment_score(news_feed: List[Dict], ticker: str) -> Dict:
                 total_score += float(ts.get("ticker_sentiment_score", 0))
                 break
                 
+    if count == 0:
+        return {"label": "neutral", "score": 0.5, "count": 0}
+        
+    avg_score = total_score / count
+    
+    label = "neutral"
+    if avg_score >= 0.15:
+        label = "positive"
+    elif avg_score <= -0.15:
+        label = "negative"
+        
+    return {
+        "label": label,
+        "score": abs(avg_score),
+        "avg_raw_score": avg_score,
+        "count": count
+    }
+
+async def aggregate_local_sentiment(news_feed: List[Dict]) -> Dict:
+    """
+    Uses local FinBERT to analyze the news feed.
+    """
+    if not news_feed:
+        return {"label": "neutral", "score": 0.5, "count": 0}
+        
+    total_score = 0
+    count = 0
+    
+    # Process news items (limit to 10 for performance)
+    tasks = []
+    for item in news_feed[:10]:
+        text = f"{item.get('title', '')}. {item.get('summary', '')}"
+        if text.strip():
+            # Run in thread pool because it's CPU intensive
+            tasks.append(asyncio.to_thread(analyze_sentiment, text))
+            
+    if not tasks:
+        return {"label": "neutral", "score": 0.5, "count": 0}
+        
+    results = await asyncio.gather(*tasks)
+    
+    for res in results:
+        # FinBERT score is the probability of the predicted label
+        # We need to convert it to a -1 to 1 range for averaging
+        val = res['score']
+        if res['label'] == 'negative':
+            val = -val
+        elif res['label'] == 'neutral':
+            val = 0 # Neutral doesn't push the score
+            
+        total_score += val
+        count += 1
+        
     if count == 0:
         return {"label": "neutral", "score": 0.5, "count": 0}
         

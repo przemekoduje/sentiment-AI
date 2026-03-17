@@ -28,7 +28,7 @@ def get_trading_signal(technical_indicator: str, sentiment_label: str, sentiment
     # Gating Logic
     if sentiment_score < 0.3:
         return {
-            "decision": "SKIP",
+            "action": "SKIP",
             "reasoning": "Sentiment Gating: Information risk too high for entry.",
             "is_confident": False,
             "confidence": confidence
@@ -36,13 +36,16 @@ def get_trading_signal(technical_indicator: str, sentiment_label: str, sentiment
 
     if technical_bullish and sentiment_positive and sentiment_score > 0.6:
         decision = "BUY"
-        reasoning.append("Bullish Tech & Positive AI Sentiment matched.")
+        reasoning.append("Signal: Bullish Tech & Positive AI Sentiment matched.")
     elif sentiment_label == "negative" and sentiment_score > 0.7:
         decision = "SELL"
-        reasoning.append("Strongly Negative AI Sentiment detected.")
+        reasoning.append("Signal: Strongly Negative AI Sentiment detected.")
     else:
         decision = "HOLD"
-        reasoning.append("Mixed signals across layers.")
+        if not technical_bullish and sentiment_score > 0.5:
+            reasoning.append("Gated: Technical Trend (SMA) must confirm Sentiment.")
+        else:
+            reasoning.append("Wait: Mixed signals across layers.")
 
     if insider_score > 0.8:
         reasoning.append("Smart Money: Cluster Buying detected (+15% Conf).")

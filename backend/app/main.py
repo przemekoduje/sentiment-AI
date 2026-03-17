@@ -13,53 +13,87 @@ env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
 load_dotenv(dotenv_path=env_path)
 
 from .modules.live_discovery import LiveDiscoveryEngine
+from .modules.ticker_provider import TickerProvider
 from .modules.decision_matrix import get_trading_signal
 from .modules.roi_calculator import calculate_potential_roi
 from .modules.technical_analysis import get_technical_indicator
-from .modules.sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_score
+from .modules.sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_score, aggregate_local_sentiment
 from .modules.backtester import BacktestEngine
 from .modules.bulk_backtester import BulkBacktester
 from .modules.portfolio_manager import PortfolioManager
+from .modules.yf_manager import safe_download
 import asyncio
+import math
+
+def sanitize_nan(obj, fallback=0.0):
+    """Recursively replaces NaN/Inf with fallback in dicts, lists, and floats."""
+    if isinstance(obj, dict):
+        return {k: sanitize_nan(v, fallback) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_nan(v, fallback) for v in obj]
+    elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return fallback
+    return obj
 
 app = FastAPI(title="Sentiment AI Trading Engine")
 
 # Init discovery engine once for global cache
 discovery_engine = LiveDiscoveryEngine()
 portfolio = PortfolioManager(initial_capital=10000.0)
+AUTO_PILOT_ENABLED = False # Master switch for automated execution
 
 # --- Background Market Monitor (Production Scaling) ---
 async def market_monitor_loop():
-    """Pętla tła: Skanuje rynek cyklicznie i symuluje trading na żywo."""
+    """Pętla tła: Skanuje rynek cyklicznie i zarządza pozycjami (Auto-Pilot)."""
     print(">>> Starting Background Market Monitor...")
     while True:
         try:
-            # Skanujemy 100 najwiekszych spółek (Phase 5)
+            # 1. Skanujemy rynek (Phase 5)
             await discovery_engine.refresh_cache(limit=100)
             
-            # Simulated Trading: Automatyczne otwieranie pozycji na podstawie sygnałów BUY
-            signals = discovery_engine.get_cached_signals()
-            current_time = datetime.now().isoformat()
-            
-            for signal in signals:
-                ticker = signal['symbol']
-                if signal['action'] == "BUY" and ticker not in portfolio.positions:
-                    # Symulujemy SL/TP na poziomie 5% / 10%
-                    entry_price = signal['price']
-                    sl = entry_price * 0.95
-                    tp = entry_price * 1.10
-                    portfolio.open_position(
-                        ticker=ticker,
-                        entry_price=entry_price,
-                        entry_time=current_time,
-                        sl=sl,
-                        tp=tp,
-                        sl_pct=0.05
-                    )
-                    print(f"LIVE_TRADE: Opened BUY for {ticker} at ${entry_price}")
+            # 2. Monitorowanie otwartych pozycji (Automatyczne Wyjście)
+            if portfolio.positions:
+                current_time = datetime.now().isoformat()
+                position_tickers = list(portfolio.positions.keys())
+                try:
+                    # Pobieramy ceny dla otwartych pozycji
+                    data = await asyncio.to_thread(safe_download, position_tickers, period="1d", interval="1m", progress=False)
+                    if not data.empty:
+                        for ticker in position_tickers:
+                            pos = portfolio.positions[ticker]
+                            # Handle single-ticker vs multi-ticker results from yfinance
+                            if len(position_tickers) > 1:
+                                current_price = data['Close'][ticker].iloc[-1]
+                            else:
+                                current_price = data['Close'].iloc[-1]
+                            
+                            if current_price <= pos['sl']:
+                                portfolio.close_position(ticker, current_price, current_time, "STOP_LOSS (AUTO)")
+                                print(f"AUTO_PILOT: Closed {ticker} at ${current_price} due to STOP_LOSS")
+                            elif current_price >= pos['tp']:
+                                portfolio.close_position(ticker, current_price, current_time, "TAKE_PROFIT (AUTO)")
+                                print(f"AUTO_PILOT: Closed {ticker} at ${current_price} due to TAKE_PROFIT")
+                except Exception as e:
+                    print(f"Auto-Pilot Monitor Error (Exit Check): {e}")
 
-            # Odświeżamy co 5 minut
-            await asyncio.sleep(300) 
+            # 3. Automatyczne otwarcie (Auto-Pilot Entry)
+            if AUTO_PILOT_ENABLED:
+                signals = discovery_engine.get_cached_signals()
+                current_time = datetime.now().isoformat()
+                for signal in signals:
+                    ticker = signal['symbol']
+                    if signal['action'] == "BUY" and ticker not in portfolio.positions:
+                        entry_price = signal['price']
+                        sl = entry_price * 0.95
+                        tp = entry_price * 1.10
+                        success = portfolio.open_position(
+                            ticker=ticker, entry_price=entry_price, entry_time=current_time,
+                            sl=sl, tp=tp, sl_pct=0.05
+                        )
+                        if success:
+                            print(f"AUTO_PILOT: Executed BUY for {ticker} at ${entry_price}")
+
+            await asyncio.sleep(120) # Szybsze pętlowanie w trybie Auto
         except Exception as e:
             print(f"Monitor Loop Error: {e}")
             await asyncio.sleep(60)
@@ -82,7 +116,53 @@ app.add_middleware(
 async def root():
     return {"status": "running", "message": "Sentiment AI API is online"}
 
+@app.get("/api/markets")
+async def get_markets():
+    """List available market categories."""
+    return [
+        {"id": "SP500", "label": "S&P 500", "description": "Top US Large Cap"}
+    ]
+
+@app.get("/api/markets/active")
+async def get_active_market():
+    """Returns the currently active market for the background monitor."""
+    return {"active_market": discovery_engine.active_market}
+
+@app.post("/api/markets/active")
+async def set_active_market(market: str = Query(...)):
+    """Sets the active market category."""
+    valid_markets = ["SP500", "NASDAQ", "CRYPTO", "POLAND"]
+    if market.upper() not in valid_markets:
+        raise HTTPException(status_code=400, detail="Invalid market category")
+    
+    discovery_engine.set_active_market(market.upper())
+    return {"status": "updated", "active_market": market.upper()}
+
+@app.get("/api/autopilot")
+async def get_autopilot_status():
+    return {"enabled": AUTO_PILOT_ENABLED}
+
+@app.post("/api/autopilot")
+async def toggle_autopilot(enabled: bool = Query(...)):
+    global AUTO_PILOT_ENABLED
+    AUTO_PILOT_ENABLED = enabled
+    state = "ENABLED" if enabled else "DISABLED"
+    print(f">>> AUTO-PILOT {state}")
+    return {"status": "updated", "enabled": AUTO_PILOT_ENABLED}
+
+@app.get("/api/markets/tickers")
+async def get_market_tickers():
+    """Returns the full list of tickers for the currently active market."""
+    active_market = discovery_engine.active_market
+    tickers = TickerProvider.get_tickers_by_market(active_market)
+    return {
+        "market": active_market,
+        "count": len(tickers),
+        "tickers": tickers
+    }
+
 @app.get("/api/live/performance")
+
 async def get_live_performance():
     """
     Zwraca aktualne statystyki portfela na żywo.
@@ -100,10 +180,10 @@ async def get_live_performance():
 
     return {
         "total_trades_24h": total_trades,
-        "win_rate": round(win_rate, 1),
-        "net_pnl": round(net_pnl, 2),
+        "win_rate": sanitize_nan(win_rate, 0.0),
+        "net_pnl": sanitize_nan(net_pnl, 0.0),
         "active_positions_count": len(portfolio.positions),
-        "trade_log": portfolio.trade_log[-10:] # Ostatnie 10 transakcji
+        "trade_log": sanitize_nan(portfolio.trade_log[-10:]) # Ostatnie 10 transakcji
     }
 
 @app.get("/api/live/discovery")
@@ -134,11 +214,11 @@ async def get_live_matrix():
     print(f"[{datetime.now()}] Incoming request: /api/live/matrix")
     try:
         data = discovery_engine.get_matrix_data()
-        return {
+        return sanitize_nan({
             "status": "active",
             "timestamp": datetime.now().isoformat(),
             "matrix": data
-        }
+        })
     except Exception as e:
         import traceback
         err_msg = f"CRITICAL ERROR in /api/live/matrix: {str(e)}"
@@ -166,14 +246,45 @@ async def get_live_alerts():
 async def get_signals(ticker: str = "AAPL"):
     """
     Merging technical signals with AI sentiment.
+    Uses background cache if available for faster response.
     """
     try:
+        # Check cache first
+        cached_matrix = discovery_engine.get_matrix_data()
+        ticker_cache = next((item for item in cached_matrix if item['ticker'] == ticker), None)
+        
+        if ticker_cache:
+            # Reconstruct response from cache
+            return {
+                "ticker": ticker,
+                "current_price": sanitize_nan(ticker_cache['price']),
+                "signal": "BULLISH" if ticker_cache['sma5'] > ticker_cache['sma20'] else "NEUTRAL",
+                "confidence": sanitize_nan(ticker_cache['potential'] / 100),
+                "sentiment_label": ticker_cache['sentiment_label'],
+                "sentiment_score": ticker_cache.get('sentiment_score', 0),
+                "local_sentiment_label": ticker_cache.get('local_sentiment_label', "---"),
+                "local_sentiment_score": ticker_cache.get('local_sentiment_score', 0),
+                "technical_signal": "BULLISH" if ticker_cache['sma5'] > ticker_cache['sma20'] else "NEUTRAL",
+                "technical_indicators": {
+                    "sma5": sanitize_nan(ticker_cache['sma5']),
+                    "sma20": sanitize_nan(ticker_cache['sma20']),
+                    "rsi": sanitize_nan(ticker_cache['rsi'], fallback=50.0)
+                },
+                "formations": [],
+                "reasoning": "Data retrieved from background market scan cache.",
+                "is_confident": ticker_cache['potential'] > 60,
+                "timestamp": datetime.now().isoformat(),
+                "news_feed": [] # Cache doesn't store full feed yet
+            }
+
+        # Fallback to on-demand fetch if not in cache
         # 1. Get Technical Signal (now returns a detailed dict)
         tech_data, current_price = get_technical_indicator(ticker)
         
         # 2. Get Real-Time Sentiment from Alpha Vantage
         news_feed = await fetch_news_sentiment(ticker)
         sentiment_data = aggregate_sentiment_score(news_feed, ticker)
+        local_sentiment_data = await aggregate_local_sentiment(news_feed)
         
         # 3. Decision Matrix gating
         decision_data = get_trading_signal(
@@ -182,12 +293,15 @@ async def get_signals(ticker: str = "AAPL"):
             sentiment_score=sentiment_data['score']
         )
         
-        return {
+        return sanitize_nan({
             "ticker": ticker,
             "current_price": tech_data['price'],
             "signal": decision_data['action'],
             "confidence": decision_data['confidence'],
             "sentiment_label": sentiment_data['label'],
+            "sentiment_score": sentiment_data['score'],
+            "local_sentiment_label": local_sentiment_data['label'],
+            "local_sentiment_score": local_sentiment_data['score'],
             "technical_signal": tech_data['signal'],
             "technical_indicators": tech_data['indicators'],
             "formations": tech_data['formations'],
@@ -195,7 +309,7 @@ async def get_signals(ticker: str = "AAPL"):
             "is_confident": decision_data['is_confident'],
             "timestamp": datetime.now().isoformat(),
             "news_feed": news_feed[:10]  # Return top 10 news
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -392,4 +506,4 @@ async def run_bulk_backtest(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000) 

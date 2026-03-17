@@ -16,10 +16,34 @@ class TickerProvider:
             # Clean tickers (replace dots with dashes for yfinance compatibility)
             return [t.replace('.', '-') for t in tickers]
         except Exception as e:
-            print(f"Error fetching symbols: {e}")
-            # Fallback to top 10 if Wikipedia fails
+            print(f"Error fetching symbols from Wikipedia: {e}")
             return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "JNJ", "V"]
 
+    @staticmethod
+    def get_nasdaq100_tickers():
+        """Fetches NASDAQ 100 tickers."""
+        # Top 20 for performance/free-tier focus
+        return ["AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "GOOG", "META", "TSLA", "AVGO", "PEP", "COST", "ADBE", "CSCO", "NFLX", "AMD", "INTC", "TMUS", "CMCSA", "AMGN", "TXN"]
+
+    @staticmethod
+    def get_crypto_tickers():
+        """Top crypto pairs (Yahoo Finance format)."""
+        return ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "ADA-USD", "AVAX-USD", "DOT-USD", "LINK-USD", "MATIC-USD"]
+
+    @staticmethod
+    def get_wig20_tickers():
+        """Top Polish WIG20 companies (Yahoo Finance format)."""
+        return ["PKO.WA", "PKN.WA", "ALE.WA", "PEO.WA", "PZU.WA", "DNP.WA", "LPP.WA", "KGH.WA", "CDR.WA", "SPL.WA"]
+
+    @classmethod
+    def get_tickers_by_market(cls, market: str):
+        market = market.upper()
+        if market == "NASDAQ": return cls.get_nasdaq100_tickers()
+        if market == "CRYPTO": return cls.get_crypto_tickers()
+        if market == "POLAND": return cls.get_wig20_tickers()
+        return cls.get_sp500_tickers()
+
 if __name__ == "__main__":
-    tickers = TickerProvider.get_sp500_tickers()
-    print(f"Fetched {len(tickers)} tickers. Top 5: {tickers[:5]}")
+    print(f"S&P 500: {TickerProvider.get_sp500_tickers()[:5]}")
+    print(f"Crypto: {TickerProvider.get_crypto_tickers()[:5]}")
+
