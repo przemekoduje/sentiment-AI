@@ -38,6 +38,8 @@ def get_technical_indicator(ticker: str):
     sma50 = float(last_row['SMA50'])
     rsi = float(last_row['RSI'])
     current_price = float(last_row['Close'])
+    prev_close = float(prev_row['Close'])
+    change_pct = ((current_price / prev_close) - 1) * 100 if prev_close != 0 else 0
     
     # Formations detection
     formations = []
@@ -67,6 +69,7 @@ def get_technical_indicator(ticker: str):
     result = {
         "signal": signal,
         "price": round(current_price, 2),
+        "change_pct": round(change_pct, 2),
         "indicators": indicators,
         "formations": formations
     }

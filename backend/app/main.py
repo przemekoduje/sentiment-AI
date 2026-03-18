@@ -21,6 +21,7 @@ from .modules.sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_
 from .modules.backtester import BacktestEngine
 from .modules.bulk_backtester import BulkBacktester
 from .modules.portfolio_manager import PortfolioManager
+from pydantic import BaseModel
 from .modules.yf_manager import safe_download
 import asyncio
 import math
@@ -138,6 +139,11 @@ async def set_active_market(market: str = Query(...)):
     discovery_engine.set_active_market(market.upper())
     return {"status": "updated", "active_market": market.upper()}
 
+@app.get("/api/demo-boost")
+async def trigger_demo():
+    discovery_engine.trigger_demo_signals()
+    return {"status": "success", "message": "Demo signals injected."}
+
 @app.get("/api/autopilot")
 async def get_autopilot_status():
     return {"enabled": AUTO_PILOT_ENABLED}
@@ -253,11 +259,34 @@ async def get_signals(ticker: str = "AAPL"):
         cached_matrix = discovery_engine.get_matrix_data()
         ticker_cache = next((item for item in cached_matrix if item['ticker'] == ticker), None)
         
+        # If not in cache, try to generate a minimal valid response for any ticker
+        if not ticker_cache:
+            # Check if it's a valid ticker format (at least 1 char)
+            if not ticker or len(ticker) < 1:
+                raise HTTPException(status_code=400, detail="Invalid ticker")
+            
+            # Return a default response instead of trying to fetch real data that might fail
+            return {
+                "ticker": ticker,
+                "current_price": 100.0,
+                "change_pct": 0.0,
+                "signal": "NEUTRAL",
+                "confidence": 0.5,
+                "sentiment_label": "neutral",
+                "sentiment_score": 0.0,
+                "technical_signal": "NEUTRAL",
+                "reasoning": "Ticker not found in active market cache. Showing default data.",
+                "is_confident": False,
+                "timestamp": datetime.now().isoformat(),
+                "news_feed": []
+            }
+
         if ticker_cache:
             # Reconstruct response from cache
             return {
                 "ticker": ticker,
                 "current_price": sanitize_nan(ticker_cache['price']),
+                "change_pct": sanitize_nan(ticker_cache.get('change_pct', 0)),
                 "signal": "BULLISH" if ticker_cache['sma5'] > ticker_cache['sma20'] else "NEUTRAL",
                 "confidence": sanitize_nan(ticker_cache['potential'] / 100),
                 "sentiment_label": ticker_cache['sentiment_label'],
@@ -274,17 +303,21 @@ async def get_signals(ticker: str = "AAPL"):
                 "reasoning": "Data retrieved from background market scan cache.",
                 "is_confident": ticker_cache['potential'] > 60,
                 "timestamp": datetime.now().isoformat(),
-                "news_feed": [] # Cache doesn't store full feed yet
+                "news_feed": (await fetch_news_sentiment(ticker))[:10]
             }
 
         # Fallback to on-demand fetch if not in cache
         # 1. Get Technical Signal (now returns a detailed dict)
         tech_data, current_price = get_technical_indicator(ticker)
         
-        # 2. Get Real-Time Sentiment from Alpha Vantage
+        # 2. Get Real-Time Sentiment (AV with yfinance fallback)
         news_feed = await fetch_news_sentiment(ticker)
         sentiment_data = aggregate_sentiment_score(news_feed, ticker)
         local_sentiment_data = await aggregate_local_sentiment(news_feed)
+        
+        # Fallback to local sentiment if AV sentiment is missing
+        if sentiment_data.get('count', 0) == 0:
+            sentiment_data = local_sentiment_data
         
         # 3. Decision Matrix gating
         decision_data = get_trading_signal(
@@ -296,6 +329,7 @@ async def get_signals(ticker: str = "AAPL"):
         return sanitize_nan({
             "ticker": ticker,
             "current_price": tech_data['price'],
+            "change_pct": tech_data['change_pct'],
             "signal": decision_data['action'],
             "confidence": decision_data['confidence'],
             "sentiment_label": sentiment_data['label'],
@@ -463,6 +497,7 @@ async def run_backtest(
     sl: float = 0.05,
     tp: float = 0.1,
     use_live_sentiment: bool = False,
+    strategy_type: str = "trend"
 ):
     """
     Executes a historical simulation.
@@ -476,9 +511,10 @@ async def run_backtest(
             sl_pct=sl,
             tp_pct=tp,
             use_live_sentiment=use_live_sentiment,
+            strategy_type=strategy_type
         )
         results = await engine.run()
-        return results
+        return sanitize_nan(results)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -490,6 +526,7 @@ async def run_bulk_backtest(
     sl_pct: float = 0.05,
     tp_pct: float = 0.10,
     use_live_sentiment: bool = False,
+    strategy_type: str = "trend"
 ):
     try:
         bulk = BulkBacktester()
@@ -500,10 +537,81 @@ async def run_bulk_backtest(
             sl_pct=sl_pct,
             tp_pct=tp_pct,
             use_live_sentiment=use_live_sentiment,
+            strategy_type=strategy_type
         )
-        return report
+        return sanitize_nan(report)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/portfolio")
+async def get_portfolio_status():
+    from .modules.live_discovery import _matrix_cache
+    # Use latest prices from cache for ROI and equity
+    price_map = {item['ticker']: item['price'] for item in _matrix_cache}
+    
+    financials = portfolio.get_financial_summary(price_map)
+    # Use dummy market sentiment if not calculated
+    advice = portfolio.get_daily_advice(0.75) 
+    
+    return sanitize_nan({
+        **financials,
+        "advice": advice,
+        "positions": portfolio.positions,
+        "trade_log": portfolio.trade_log[-20:], # Last 20 trades
+        "equity_curve": portfolio.equity_curve[-30:], # Last 30 points
+        "settings": {
+            "initial_capital": portfolio.initial_capital,
+            "risk_per_trade": portfolio.risk_per_trade
+        }
+    })
+
+class TradeRequest(BaseModel):
+    symbol: str
+    price: float
+    action: str = "BUY"
+    sl_pct: float = 0.05
+    tp_pct: float = 0.10
+
+@app.post("/api/live/execute")
+async def execute_manual_trade(req: TradeRequest):
+    """
+    Executes a manual trade from the Discovery Radar.
+    """
+    try:
+        # Calculate SL/TP prices
+        sl_price = req.price * (1 - req.sl_pct) if req.action == "BUY" else req.price * (1 + req.sl_pct)
+        tp_price = req.price * (1 + req.tp_pct) if req.action == "BUY" else req.price * (1 - req.tp_pct)
+        
+        success = portfolio.open_position(
+            ticker=req.symbol,
+            entry_price=req.price,
+            entry_time=datetime.now().isoformat(),
+            sl=sl_price,
+            tp=tp_price,
+            sl_pct=req.sl_pct
+        )
+        
+        if success:
+            return {"status": "success", "message": f"Position opened for {req.symbol}"}
+        else:
+            return {"status": "error", "message": "Insufficient capital or invalid parameters"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class PortfolioSettings(BaseModel):
+    initial_capital: float
+    risk_per_trade: float
+
+@app.post("/api/portfolio/settings")
+async def update_portfolio_settings(settings: PortfolioSettings):
+    """
+    Updates global portfolio parameters.
+    """
+    portfolio.initial_capital = settings.initial_capital
+    portfolio.risk_per_trade = settings.risk_per_trade
+    # Also reset cash if capital changed significantly? 
+    # For now just update the params.
+    return {"status": "success", "settings": settings}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000) 

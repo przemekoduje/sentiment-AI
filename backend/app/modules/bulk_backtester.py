@@ -34,6 +34,7 @@ class BulkBacktester:
         sl_pct: float = 0.05,
         tp_pct: float = 0.10,
         use_live_sentiment: bool = False,
+        strategy_type: str = "trend"
     ) -> Dict:
         """Runs a unified portfolio backtest across all tickers."""
         if not tickers:
@@ -53,6 +54,7 @@ class BulkBacktester:
                     sl_pct=sl_pct,
                     tp_pct=tp_pct,
                     use_live_sentiment=use_live_sentiment,
+                    strategy_type=strategy_type
                 )
                 data = await engine.prepare_data()
                 if data is None or data.empty:
@@ -123,7 +125,8 @@ class BulkBacktester:
                     continue  # Already holding this ticker
 
                 engine = engine_by_ticker[ticker]
-                signal = engine.get_signal(row, prev_row)
+                data_slice = data.iloc[max(0, date_idx-30):date_idx+1]
+                signal = engine.get_signal(data_slice)
 
                 if signal == "BUY":
                     sl_val = price * (1 - sl_pct)

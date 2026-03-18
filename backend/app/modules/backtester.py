@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from .portfolio_manager import PortfolioManager
 from .decision_matrix import get_trading_signal
 from .sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_score
+from .volume_analysis import get_volume_signal
+from .candlestick_patterns import get_candlestick_signal
 
 class BacktestEngine:
     def __init__(
@@ -16,6 +18,7 @@ class BacktestEngine:
         tp_pct: float = 0.1,
         portfolio: PortfolioManager = None,
         use_live_sentiment: bool = False,
+        strategy_type: str = "trend" # trend, volume, candlestick
     ):
         self.ticker = ticker
         self.start_date = start_date
@@ -23,6 +26,7 @@ class BacktestEngine:
         self.sl_pct = sl_pct
         self.tp_pct = tp_pct
         self.use_live_sentiment = use_live_sentiment
+        self.strategy_type = strategy_type
         # Allow an external shared portfolio to be injected (used by BulkBacktester)
         self.portfolio = portfolio if portfolio is not None else PortfolioManager(initial_capital=capital)
         # Sentiment cache: date_str -> {label, score}
@@ -63,7 +67,7 @@ class BacktestEngine:
     async def fetch_sentiment_for_date(self, date_str: str) -> dict:
         """
         Returns sentiment for a given date.
-        - Live mode: fetches from Alpha Vantage for that week window.
+        - Live mode: fetches from Global News Source (AV/yfinance) for that week window.
         - Simulated mode: always returns {'label': 'positive', 'score': 0.75}
         """
         if not self.use_live_sentiment:
@@ -85,46 +89,78 @@ class BacktestEngine:
         self._sentiment_cache[date_str] = result
         return result
 
-    async def get_signal_async(self, row, prev_row, date_str: str) -> str:
-        """Evaluates one candle (async, fetches sentiment if live mode)."""
+    async def get_signal_async(self, data_slice: pd.DataFrame, date_str: str) -> str:
+        """Evaluates signal based on selected strategy_type."""
+        if data_slice.empty: return "HOLD"
+        
+        row = data_slice.iloc[-1]
+        prev_row = data_slice.iloc[-2] if len(data_slice) > 1 else row
+        
         def scalar(val):
             return float(val.iloc[0]) if isinstance(val, pd.Series) else float(val)
 
-        sma5       = scalar(row['SMA5'])
-        sma20      = scalar(row['SMA20'])
-        prev_sma5  = scalar(prev_row['SMA5'])
-        prev_sma20 = scalar(prev_row['SMA20'])
-
         tech_signal = "NEUTRAL"
-        if sma5 > sma20 and prev_sma5 <= prev_sma20:
-            tech_signal = "BULLISH"
-        elif sma5 < sma20 and prev_sma5 >= prev_sma20:
-            tech_signal = "BEARISH"
+        reasoning = ""
+
+        if self.strategy_type == "trend":
+            sma5       = scalar(row['SMA5'])
+            sma20      = scalar(row['SMA20'])
+            prev_sma5  = scalar(prev_row['SMA5'])
+            prev_sma20 = scalar(prev_row['SMA20'])
+            if sma5 > sma20 and prev_sma5 <= prev_sma20:
+                tech_signal = "BULLISH"
+            elif sma5 < sma20 and prev_sma5 >= prev_sma20:
+                tech_signal = "BEARISH"
+        
+        elif self.strategy_type == "volume":
+            v_res = get_volume_signal(data_slice)
+            tech_signal = "BULLISH" if v_res['signal'] == "BUY" else "NEUTRAL"
+            reasoning = v_res['reasoning']
+
+        elif self.strategy_type == "candlestick":
+            c_res = get_candlestick_signal(data_slice)
+            tech_signal = "BULLISH" if c_res['signal'] == "BUY" else "NEUTRAL"
+            reasoning = c_res['reasoning']
 
         sentiment = await self.fetch_sentiment_for_date(date_str)
         decision = get_trading_signal(tech_signal, sentiment['label'], sentiment['score'])
-        return decision['decision']
+        
+        if reasoning:
+            decision['reasoning'] = reasoning
+            
+        return decision['action']
 
-    def get_signal(self, row, prev_row) -> str:
-        """Sync version used by BulkBacktester (sentiment is pre-fetched or simulated)."""
+    def get_signal(self, data_slice: pd.DataFrame) -> str:
+        """Sync version used by BulkBacktester."""
+        if data_slice.empty: return "HOLD"
+        
+        row = data_slice.iloc[-1]
+        prev_row = data_slice.iloc[-2] if len(data_slice) > 1 else row
+        
         def scalar(val):
             return float(val.iloc[0]) if isinstance(val, pd.Series) else float(val)
 
-        sma5       = scalar(row['SMA5'])
-        sma20      = scalar(row['SMA20'])
-        prev_sma5  = scalar(prev_row['SMA5'])
-        prev_sma20 = scalar(prev_row['SMA20'])
-
         tech_signal = "NEUTRAL"
-        if sma5 > sma20 and prev_sma5 <= prev_sma20:
-            tech_signal = "BULLISH"
-        elif sma5 < sma20 and prev_sma5 >= prev_sma20:
-            tech_signal = "BEARISH"
+        if self.strategy_type == "trend":
+            sma5       = scalar(row['SMA5'])
+            sma20      = scalar(row['SMA20'])
+            prev_sma5  = scalar(prev_row['SMA5'])
+            prev_sma20 = scalar(prev_row['SMA20'])
+            if sma5 > sma20 and prev_sma5 <= prev_sma20:
+                tech_signal = "BULLISH"
+            elif sma5 < sma20 and prev_sma5 >= prev_sma20:
+                tech_signal = "BEARISH"
+        elif self.strategy_type == "volume":
+            v_res = get_volume_signal(data_slice)
+            tech_signal = "BULLISH" if v_res['signal'] == "BUY" else "NEUTRAL"
+        elif self.strategy_type == "candlestick":
+            c_res = get_candlestick_signal(data_slice)
+            tech_signal = "BULLISH" if c_res['signal'] == "BUY" else "NEUTRAL"
 
-        # In bulk mode we always use simulated sentiment (live would be too slow per-candle)
+        # In bulk mode we always use simulated sentiment
         sentiment = {"label": "positive", "score": 0.75}
         decision = get_trading_signal(tech_signal, sentiment['label'], sentiment['score'])
-        return decision['decision']
+        return decision['action']
 
     async def run(self):
         """Single-ticker backtest using own private portfolio."""
@@ -132,11 +168,19 @@ class BacktestEngine:
         if data is None or data.empty:
             return {"error": f"No data found for {self.ticker}"}
 
-        for i in range(1, len(data)):
+        # Need enough data for Volume/Candlestick window (approx 21-30 candles)
+        start_idx = 25 if self.strategy_type != "trend" else 1
+
+        for i in range(start_idx, len(data)):
+            data_slice = data.iloc[max(0, i-30):i+1]
             row = data.iloc[i]
-            prev_row = data.iloc[i - 1]
             timestamp = data.index[i].strftime("%Y-%m-%d")
-            price = float(row['Close'].iloc[0]) if isinstance(row['Close'], pd.Series) else float(row['Close'])
+            
+            # Extract price correctly
+            try:
+                price = float(row['Close'].iloc[0]) if isinstance(row['Close'], pd.Series) else float(row['Close'])
+            except:
+                price = float(row['Close'])
 
             if self.ticker in self.portfolio.positions:
                 pos = self.portfolio.positions[self.ticker]
@@ -145,8 +189,8 @@ class BacktestEngine:
                 elif price >= pos['tp']:
                     self.portfolio.close_position(self.ticker, price, timestamp, "TAKE PROFIT")
 
-            # Use async signal (supports both live and simulated sentiment)
-            signal = await self.get_signal_async(row, prev_row, timestamp)
+            # Use async signal with data window
+            signal = await self.get_signal_async(data_slice, timestamp)
 
             if signal == "BUY" and self.ticker not in self.portfolio.positions:
                 sl_val = price * (1 - self.sl_pct)
@@ -158,7 +202,10 @@ class BacktestEngine:
             self.portfolio.update_equity({self.ticker: price}, timestamp)
 
         if self.ticker in self.portfolio.positions:
-            last_price = float(data.iloc[-1]['Close'])
+            try:
+                last_price = float(data.iloc[-1]['Close'].iloc[0]) if isinstance(data.iloc[-1]['Close'], pd.Series) else float(data.iloc[-1]['Close'])
+            except:
+                last_price = float(data.iloc[-1]['Close'])
             self.portfolio.close_position(self.ticker, last_price, data.index[-1].strftime("%Y-%m-%d"), "BACKTEST END")
 
         return {

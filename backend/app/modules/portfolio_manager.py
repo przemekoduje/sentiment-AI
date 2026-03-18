@@ -7,16 +7,55 @@ class PortfolioManager:
         self.equity_curve = []
         self.trade_log = []
 
+    def get_financial_summary(self, current_prices: dict):
+        total_involved = 0
+        total_unrealized_pnl = 0
+        risk_exposure = 0
+        
+        for ticker, pos in self.positions.items():
+            price = current_prices.get(ticker, pos['entry_price'])
+            total_involved += pos['qty'] * pos['entry_price']
+            total_unrealized_pnl += (price - pos['entry_price']) * pos['qty']
+            # Risk is defined as the distance to SL
+            risk_exposure += (pos['entry_price'] - pos['sl']) * pos['qty']
+            
+        return {
+            "cash": round(self.current_cash, 2),
+            "equity": round(self.current_cash + total_involved + total_unrealized_pnl, 2),
+            "involved": round(total_involved, 2),
+            "unrealized_pnl": round(total_unrealized_pnl, 2),
+            "risk_exposure": round(risk_exposure, 2),
+            "position_count": len(self.positions)
+        }
+
+    def get_daily_advice(self, market_sentiment: float):
+        """Generates intelligence advice based on current exposure."""
+        if not self.positions:
+            if market_sentiment > 0.6:
+                return "Market sentiment is bullish. AI suggests scanning for high-confidence entries in S&P 500."
+            return "Market is neutral. Focus on defensive sectors or wait for clearer signals."
+            
+        advice = []
+        if len(self.positions) > 5:
+            advice.append("High diversification reached. Monitor SL levels closely to prevent global drawdown.")
+        
+        avg_pnl = sum((t['pnl'] for t in self.trade_log[-5:])) if self.trade_log else 0
+        if avg_pnl < 0:
+            advice.append("Recent performance dip detected. Recommend reducing position sizes (SL 2-3%) for new entries.")
+            
+        return " | ".join(advice) if advice else "Current positions are healthy. Sentiment backup is stable."
+
     def calculate_position_size(self, ticker: str, entry_price: float, sl_pct: float):
         """
-        Calculates quantity based on SL engagement rule:
-        Position Size (USD) = Initial Capital * SL%
-        Example: $10,000 capital and 5% SL -> $500 position.
+        Calculates quantity based on standard Money Management:
+        Allocation = (Current Capital * Risk Per Trade) / Stop Loss %
+        Example: $10,000 capital, 2% risk, 5% stop -> $4,000 position.
         """
         if sl_pct <= 0:
             return 0
             
-        allocation_usd = self.initial_capital * sl_pct
+        risk_amount = self.initial_capital * self.risk_per_trade
+        allocation_usd = risk_amount / sl_pct
         
         # Check if we have enough cash for this allocation
         if allocation_usd > self.current_cash:

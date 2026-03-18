@@ -92,6 +92,7 @@ class LiveDiscoveryEngine:
                     rsi = 100 - (100 / (1 + rs))
 
                     curr_price = float(close.iloc[-1])
+                    prev_price = float(close.iloc[-2]) if len(close) > 1 else curr_price
                     curr_sma5 = float(sma5.iloc[-1])
                     curr_sma20 = float(sma20.iloc[-1])
                     curr_rsi = float(rsi.iloc[-1])
@@ -99,6 +100,7 @@ class LiveDiscoveryEngine:
                     results.append({
                         "ticker": ticker,
                         "price": round(curr_price, 2),
+                        "change_pct": round(((curr_price / prev_price) - 1) * 100, 2) if prev_price != 0 else 0,
                         "sma5": round(curr_sma5, 2),
                         "sma20": round(curr_sma20, 2),
                         "base_rsi": round(curr_rsi, 1) if not pd.isna(curr_rsi) else 50.0,
@@ -144,8 +146,16 @@ class LiveDiscoveryEngine:
                 
                 # Sentiment (async news)
                 news_feed = await fetch_news_sentiment(ticker)
+                
+                # aggregate_sentiment_score uses scores PROVIDED by news source (e.g. Alpha Vantage)
+                # aggregate_local_sentiment uses local FinBERT on news text
                 sentiment = aggregate_sentiment_score(news_feed, ticker)
                 local_sentiment = await aggregate_local_sentiment(news_feed)
+                
+                # If Alpha Vantage sentiment is missing (e.g. yfinance fallback), 
+                # we MUST fallback to local FinBERT sentiment for the decision matrix
+                if sentiment.get('count', 0) == 0:
+                    sentiment = local_sentiment
                 
                 # Potential score calculation for display
                 potential_score = (
@@ -167,6 +177,7 @@ class LiveDiscoveryEngine:
                 matrix_item = {
                     "ticker": ticker,
                     "price": t_res['price'],
+                    "change_pct": t_res['change_pct'],
                     "sma5": t_res['sma5'],
                     "sma20": t_res['sma20'],
                     "rsi": t_res['base_rsi'],
@@ -193,7 +204,7 @@ class LiveDiscoveryEngine:
                         "confidence": round(decision['confidence'] * 100, 1),
                         "sentiment": sentiment['label'],
                         "time": datetime.now().strftime("%I:%M:%S %p"),
-                        "status": "LIVE",
+                        "status": "FILLED" if AUTO_PILOT_ENABLED else "PENDING",
                         "insider_score": insider_score,
                         "fundamental_grade": fund_data["fundamental_grade"]
                     })
@@ -308,6 +319,55 @@ class LiveDiscoveryEngine:
         if not _signal_cache:
             await self.refresh_cache(limit=limit)
         return _signal_cache
+
+    def trigger_demo_signals(self):
+        """Injects perfect BUY signals for demonstration."""
+        global _signal_cache, _matrix_cache, _last_scan_time, _initial_scan_complete
+        
+        demo_tickers = ["AAPL", "NVDA", "TSLA", "MSFT"]
+        temp_matrix = []
+        final_signals = []
+        
+        for i, ticker in enumerate(demo_tickers):
+            price = 200.0 + (i * 50)
+            matrix_item = {
+                "ticker": ticker,
+                "price": price,
+                "change_pct": 2.5 + i,
+                "sma5": price * 1.05,
+                "sma20": price * 0.95,
+                "rsi": 45.0 + (i * 2),
+                "sentiment_score": 0.95,
+                "sentiment_label": "positive",
+                "local_sentiment_score": 0.92,
+                "local_sentiment_label": "positive",
+                "insider_score": 0.98,
+                "fundamental_score": 0.95,
+                "fundamental_grade": "A",
+                "potential": 98.5 - i,
+                "decision_action": "BUY",
+                "decision_reasoning": "DEMO: Perfect alignment of Tech, Sentiment, and Insider data.",
+                "timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+            temp_matrix.append(matrix_item)
+            final_signals.append({
+                "symbol": ticker,
+                "company": f"{ticker} Corp (DEMO)",
+                "action": "BUY",
+                "price": price,
+                "confidence": 98.5 - i,
+                "sentiment": "positive",
+                "time": datetime.now().strftime("%I:%M:%S %p"),
+                "status": "FILLED" if AUTO_PILOT_ENABLED else "PENDING",
+                "insider_score": 0.98,
+                "fundamental_grade": "A"
+            })
+            
+        _signal_cache = final_signals
+        _matrix_cache = temp_matrix
+        _last_scan_time = datetime.now()
+        _initial_scan_complete = True
+        print(f">>> DEMO MODE: Injected {len(demo_tickers)} perfect signals.")
 
 if __name__ == "__main__":
     engine = LiveDiscoveryEngine()

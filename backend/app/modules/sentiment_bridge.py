@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict
 import asyncio
 from dotenv import load_dotenv
+import yfinance as yf
 from .sentiment_analyzer import analyze_sentiment
 
 # Disk-based caching setup
@@ -73,9 +74,10 @@ MOCK_FEED = {
 
 async def fetch_news_sentiment(ticker: str, time_from: str = None, time_to: str = None) -> List[Dict]:
     """
-    Fetches news sentiment from Alpha Vantage with disk caching.
+    Fetches news sentiment from Alpha Vantage or yfinance with disk caching.
+    Falls back to yfinance if Alpha Vantage is unavailable or rate limited.
     """
-    api_key = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
+    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
     
     # Simple caching logic
     cache_file = os.path.join(CACHE_DIR, f"news_{ticker}.json")
@@ -89,43 +91,82 @@ async def fetch_news_sentiment(ticker: str, time_from: str = None, time_to: str 
             except Exception:
                 pass
 
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "NEWS_SENTIMENT",
-        "tickers": ticker,
-        "apikey": api_key,
-        "sort": "LATEST",
-        "limit": 50
-    }
-    
-    if time_from:
-        params["time_from"] = time_from.replace("-", "") + "T0000"
-    if time_to:
-        params["time_to"] = time_to.replace("-", "") + "T2359"
+    # Try Alpha Vantage first IF we have an API key that isn't "demo"
+    if api_key and api_key != "demo":
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ticker,
+            "apikey": api_key,
+            "sort": "LATEST",
+            "limit": 50
+        }
+        
+        if time_from:
+            params["time_from"] = time_from.replace("-", "") + "T0000"
+        if time_to:
+            params["time_to"] = time_to.replace("-", "") + "T2359"
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, params=params, timeout=10.0)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "feed" in data:
-                feed = data["feed"]
-                try:
-                    with open(cache_file, "w") as f:
-                        json.dump(feed, f)
-                except Exception:
-                    pass
-                return feed
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(url, params=params, timeout=10.0)
+                response.raise_for_status()
+                data = response.json()
                 
-            if "Note" in data or "Information" in data:
-                 print(f"Alpha Vantage Notice for {ticker}: {data.get('Note', data.get('Information'))}")
+                if "feed" in data:
+                    feed = data["feed"]
+                    try:
+                        with open(cache_file, "w") as f:
+                            json.dump(feed, f)
+                    except Exception:
+                        pass
+                    return feed
+                    
+                if "Note" in data or "Information" in data:
+                     print(f"Data Source Notice for {ticker}: {data.get('Note', data.get('Information'))}")
+            except Exception as e:
+                print(f"News Source Error for {ticker}: {e}")
+
+    # Fallback to yfinance (Free)
+    print(f">>> Using yfinance news fallback for {ticker}")
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        # ticker.news is a blocking call, run in thread
+        news_items = await asyncio.to_thread(lambda: yf_ticker.news)
+        
+        feed = []
+        for item in news_items:
+            # Map yfinance structure to our Alpha Vantage-like structure
+            # yfinance often returns a different structure depending on version
+            # Usually: {'title': ..., 'link': ..., 'providerPublishTime': ..., 'type': ..., ...}
             
-            # Use mock as fallback for demo purposes if rate limited
-            return MOCK_FEED.get(ticker, [])
-        except Exception as e:
-            print(f"Error fetching news for {ticker}: {e}")
-            return MOCK_FEED.get(ticker, [])
+            # Convert timestamp to AV-like string if available
+            pub_time = datetime.now().strftime("%Y%m%dT%H%M%S")
+            if 'providerPublishTime' in item:
+                pub_time = datetime.fromtimestamp(item['providerPublishTime']).strftime("%Y%m%dT%H%M%S")
+            
+            feed.append({
+                "title": item.get('title', 'No Title'),
+                "url": item.get('link', item.get('canonicalUrl', {}).get('url', '')),
+                "time_published": pub_time,
+                "summary": item.get('summary', ''), # yfinance doesn't always have summary
+                "ticker_sentiment": [], # We will calculate this locally later if needed
+                "source": "yfinance"
+            })
+            
+        if feed:
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(feed, f)
+            except Exception:
+                pass
+            return feed
+            
+    except Exception as e:
+        print(f"yfinance news error for {ticker}: {e}")
+
+    # Last fallback: Mock data
+    return MOCK_FEED.get(ticker, [])
 
 def aggregate_sentiment_score(news_feed: List[Dict], ticker: str) -> Dict:
     """
