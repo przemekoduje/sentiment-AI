@@ -8,4 +8,6 @@ sqlmodel
 python-dotenv
 scikit-learn
 httpx
-httpx
+openai
+firebase-admin
+lxml

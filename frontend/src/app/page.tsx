@@ -1,9 +1,10 @@
-import MainLayout from '@/components/MainLayout';
+import MainLayout from "@/components/MainLayout";
+import { Providers } from "@/components/Providers";
 
 export default function Home() {
   return (
-    <main>
+    <Providers>
       <MainLayout />
-    </main>
+    </Providers>
   );
 }

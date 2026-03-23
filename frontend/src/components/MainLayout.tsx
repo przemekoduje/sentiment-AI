@@ -12,6 +12,8 @@ import MarketInsight from './MarketInsight'
 import Portfolio from './Portfolio'
 import Alerts from './Alerts'
 
+import AlphaIntelligenceHub from './AlphaIntelligenceHub'
+
 export default function MainLayout() {
   const [activeTab, setActiveTab] = useState('overview')
   const [activeTicker, setActiveTicker] = useState('AAPL')
@@ -39,7 +41,10 @@ export default function MainLayout() {
         
         <main className="p-8">
           {activeTab === 'overview' && (
-            <MissionControl ticker={activeTicker} />
+            <AlphaIntelligenceHub 
+              ticker={activeTicker} 
+              onTickerSelect={setActiveTicker} 
+            />
           )}
           
            {activeTab === 'discovery' && (

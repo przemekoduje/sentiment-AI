@@ -6,7 +6,7 @@ class TickerProvider:
     
     @staticmethod
     def get_sp500_tickers():
-        """Fetches S&P 500 tickers from Wikipedia."""
+        """Fetches S&P 500 tickers from Wikipedia with robust error handling."""
         try:
             url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
@@ -14,10 +14,13 @@ class TickerProvider:
             df = tables[0]
             tickers = df['Symbol'].tolist()
             # Clean tickers (replace dots with dashes for yfinance compatibility)
-            return [t.replace('.', '-') for t in tickers]
+            valid_tickers = [t.replace('.', '-') for t in tickers if isinstance(t, str)]
+            print(f">>> TickerProvider: Successfully fetched {len(valid_tickers)} S&P 500 tickers.")
+            return valid_tickers
         except Exception as e:
-            print(f"Error fetching symbols from Wikipedia: {e}")
-            return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "JNJ", "V"]
+            print(f"!!! Error fetching symbols from Wikipedia: {e}. Using fallback list.")
+            # Solid fallback of high-caps
+            return ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "JNJ", "V", "WMT", "MA", "PG", "COST"]
 
     @staticmethod
     def get_nasdaq100_tickers():

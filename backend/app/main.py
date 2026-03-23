@@ -46,11 +46,19 @@ AUTO_PILOT_ENABLED = False # Master switch for automated execution
 # --- Background Market Monitor (Production Scaling) ---
 async def market_monitor_loop():
     """Pętla tła: Skanuje rynek cyklicznie i zarządza pozycjami (Auto-Pilot)."""
-    print(">>> Starting Background Market Monitor...")
+    # 15. Periodic Firebase Flush (Optimization Layer)
+    last_flush = datetime.now()
+    
     while True:
         try:
-            # 1. Skanujemy rynek (Phase 5)
-            await discovery_engine.refresh_cache(limit=100)
+            # 1. Skanujemy rynek (Phase 5 + Metoda Sita)
+            await discovery_engine.refresh_cache(limit=500)
+            
+            # Okresowy flush heatmapy (co 30 min)
+            if (datetime.now() - last_flush).total_seconds() > 1800:
+                from .modules.firebase_helper import flush_heatmap_batch
+                flush_heatmap_batch()
+                last_flush = datetime.now()
             
             # 2. Monitorowanie otwartych pozycji (Automatyczne Wyjście)
             if portfolio.positions:
@@ -62,11 +70,18 @@ async def market_monitor_loop():
                     if not data.empty:
                         for ticker in position_tickers:
                             pos = portfolio.positions[ticker]
-                            # Handle single-ticker vs multi-ticker results from yfinance
-                            if len(position_tickers) > 1:
-                                current_price = data['Close'][ticker].iloc[-1]
-                            else:
-                                current_price = data['Close'].iloc[-1]
+                            # Handle single-ticker vs multi-ticker results from yfinance robustly
+                            try:
+                                if isinstance(data['Close'], pd.DataFrame):
+                                    if ticker in data['Close'].columns:
+                                        current_price = float(data['Close'][ticker].iloc[-1])
+                                    else:
+                                        current_price = float(data['Close'].iloc[-1])
+                                else: # Series
+                                    current_price = float(data['Close'].iloc[-1])
+                            except Exception:
+                                print(f">>> Skip check for {ticker}: Price data unavailable")
+                                continue
                             
                             if current_price <= pos['sl']:
                                 portfolio.close_position(ticker, current_price, current_time, "STOP_LOSS (AUTO)")
@@ -99,10 +114,52 @@ async def market_monitor_loop():
             print(f"Monitor Loop Error: {e}")
             await asyncio.sleep(60)
 
+async def price_sync_loop():
+    """
+    High-Frequency Price Sync: Polls Alpaca every 12s for active tickers.
+    Updates Firestore snapshots to trigger real-time UI refresh.
+    """
+    from .modules.alpaca_manager import get_latest_prices
+    
+    while True:
+        try:
+            # 1. Identify which tickers need real-time updates
+            # (Those in current matrix + those in active portfolio)
+            matrix_data = discovery_engine.get_matrix_data()
+            matrix_tickers = [item['ticker'] for item in matrix_data]
+            portfolio_tickers = list(portfolio.positions.keys())
+            
+            target_tickers = list(set(matrix_tickers + portfolio_tickers))
+            
+            if target_tickers:
+                # 2. Fetch from Alpaca
+                prices = await get_latest_prices(target_tickers)
+                if prices:
+                    # 3. Update cache & Firestore
+                    discovery_engine.update_matrix_prices(prices)
+            
+            await asyncio.sleep(12) # ~5 updates per minute
+        except Exception as e:
+            print(f"Price Sync Loop Error: {e}")
+            await asyncio.sleep(10)
+
 @app.on_event("startup")
 async def startup_event():
-    # Uruchamiamy monitor w tle
+    # 1. Inicjalizacja danych statycznych (Market Caps)
+    from .modules.market_cap_provider import MarketCapProvider
+    asyncio.create_task(MarketCapProvider.refresh_caps())
+
+    # 2. Uruchamiamy monitor w tle
     asyncio.create_task(market_monitor_loop())
+    # Uruchamiamy szybką synchronizację cen
+    asyncio.create_task(price_sync_loop())
+    
+    # 3. Natychmiastowe wypełnienie heatmapy (Initial Flush)
+    try:
+        from .modules.firebase_helper import flush_heatmap_batch
+        asyncio.create_task(asyncio.to_thread(flush_heatmap_batch))
+    except Exception as e:
+        print(f"!!! Startup Heatmap Flush Error: {e}")
 
 # CORS setup for Frontend
 app.add_middleware(
@@ -259,27 +316,7 @@ async def get_signals(ticker: str = "AAPL"):
         cached_matrix = discovery_engine.get_matrix_data()
         ticker_cache = next((item for item in cached_matrix if item['ticker'] == ticker), None)
         
-        # If not in cache, try to generate a minimal valid response for any ticker
-        if not ticker_cache:
-            # Check if it's a valid ticker format (at least 1 char)
-            if not ticker or len(ticker) < 1:
-                raise HTTPException(status_code=400, detail="Invalid ticker")
-            
-            # Return a default response instead of trying to fetch real data that might fail
-            return {
-                "ticker": ticker,
-                "current_price": 100.0,
-                "change_pct": 0.0,
-                "signal": "NEUTRAL",
-                "confidence": 0.5,
-                "sentiment_label": "neutral",
-                "sentiment_score": 0.0,
-                "technical_signal": "NEUTRAL",
-                "reasoning": "Ticker not found in active market cache. Showing default data.",
-                "is_confident": False,
-                "timestamp": datetime.now().isoformat(),
-                "news_feed": []
-            }
+        # If not in cache, we will fall through to on-demand fetch (slower but complete)
 
         if ticker_cache:
             # Reconstruct response from cache
@@ -302,8 +339,8 @@ async def get_signals(ticker: str = "AAPL"):
                 "formations": [],
                 "reasoning": "Data retrieved from background market scan cache.",
                 "is_confident": ticker_cache['potential'] > 60,
-                "timestamp": datetime.now().isoformat(),
-                "news_feed": (await fetch_news_sentiment(ticker))[:10]
+                "news_feed": ticker_cache.get('news_feed', []),
+                "timestamp": datetime.now().isoformat()
             }
 
         # Fallback to on-demand fetch if not in cache
@@ -326,6 +363,25 @@ async def get_signals(ticker: str = "AAPL"):
             sentiment_score=sentiment_data['score']
         )
         
+        # --- NEW: On-Demand Firestore Sync for Mission Control ---
+        try:
+            from .modules.firebase_helper import save_analysis_snapshot
+            snapshot_data = {
+                "ticker": ticker,
+                "current_price": tech_data['price'],
+                "sentiment_score": sentiment_data['score'] if sentiment_data['label'] == 'positive' else -sentiment_data['score'],
+                "sentiment_label": sentiment_data['label'],
+                "reasoning": decision_data['reasoning'],
+                "signal": decision_data['action'],
+                "round_kelly": (sentiment_data['score'] * 0.2), # Simplified Kelly
+                "technical_signal": tech_data['signal'],
+                "news_feed": news_feed[:5]
+            }
+            # Fire and forget task to update Firestore while returning API response
+            asyncio.create_task(asyncio.to_thread(save_analysis_snapshot, ticker, snapshot_data))
+        except Exception as e:
+            print(f"!!! On-Demand Snapshot Error: {e}")
+
         return sanitize_nan({
             "ticker": ticker,
             "current_price": tech_data['price'],

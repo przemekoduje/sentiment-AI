@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react'
 import { 
-  LayoutDashboard, 
+  Brain,
   Zap, 
   FlaskConical, 
   Briefcase, 
@@ -20,7 +20,7 @@ interface SidebarProps {
 }
 
 const navItems = [
-  { id: 'overview', label: 'Mission Control', icon: LayoutDashboard },
+  { id: 'overview', label: 'Intelligence Hub', icon: Brain },
   { id: 'discovery', label: 'Live Discovery', icon: Zap },
   { id: 'insight', label: 'Asset Analysis', icon: BarChart2 },
   { id: 'analytics', label: 'Market Metrics', icon: Activity },
