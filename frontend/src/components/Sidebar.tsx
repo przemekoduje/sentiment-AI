@@ -17,6 +17,9 @@ import { cn } from '@/lib/utils'
 interface SidebarProps {
   activeTab: string
   setActiveTab: (tab: string) => void
+  isAutoPilot: boolean
+  onAutoPilotToggle: () => void
+  isAutoPilotLoading: boolean
 }
 
 const navItems = [
@@ -29,49 +32,13 @@ const navItems = [
   { id: 'lab', label: 'Strategy Lab', icon: FlaskConical },
 ]
 
-export default function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
-  const [autoPilot, setAutoPilot] = useState(false)
-  const [loading, setLoading] = useState(false)
-
-  const fetchStatus = () => {
-    fetch('http://localhost:8000/api/autopilot')
-      .then(res => res.json())
-      .then(data => setAutoPilot(data.enabled))
-      .catch(err => console.error("Failed to fetch autopilot status:", err))
-  }
-
-  useEffect(() => {
-    fetchStatus()
-    const interval = setInterval(fetchStatus, 5000) // Poll every 5s to sync
-    
-    const handleToggleEvent = (e: any) => {
-      setAutoPilot(e.detail)
-    }
-    window.addEventListener('autopilot-toggle', handleToggleEvent)
-
-    return () => {
-      clearInterval(interval)
-      window.removeEventListener('autopilot-toggle', handleToggleEvent)
-    }
-  }, [])
-
-  const toggleAutoPilot = async () => {
-    setLoading(true)
-    const newState = !autoPilot
-    try {
-      const res = await fetch(`http://localhost:8000/api/autopilot?enabled=${newState}`, {
-        method: 'POST'
-      })
-      if (res.ok) {
-        setAutoPilot(newState)
-        window.dispatchEvent(new CustomEvent('autopilot-toggle', { detail: newState }))
-      }
-    } catch (err) {
-      console.error("Failed to toggle autopilot:", err)
-    } finally {
-      setLoading(false)
-    }
-  }
+export default function Sidebar({ 
+  activeTab, 
+  setActiveTab, 
+  isAutoPilot, 
+  onAutoPilotToggle, 
+  isAutoPilotLoading 
+}: SidebarProps) {
 
   return (
     <aside className="w-64 h-screen bg-white border-r border-zinc-100 flex flex-col fixed left-0 top-0 z-30 shadow-sm">
@@ -114,26 +81,26 @@ export default function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
         <div className="px-4 py-4 rounded-3xl bg-zinc-50 border border-zinc-100 mb-4 mx-4">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
-              <Activity className={cn("w-4 h-4", autoPilot ? "text-indigo-600" : "text-zinc-400")} />
+              <Activity className={cn("w-4 h-4", isAutoPilot ? "text-indigo-600" : "text-zinc-400")} />
               <span className="text-[11px] font-black uppercase tracking-tight text-zinc-900">Auto-Pilot</span>
             </div>
             <button 
-              onClick={toggleAutoPilot}
-              disabled={loading}
+              onClick={onAutoPilotToggle}
+              disabled={isAutoPilotLoading}
               className={cn(
                 "w-10 h-5 rounded-full relative transition-all duration-300 focus:outline-none",
-                autoPilot ? "bg-indigo-600" : "bg-zinc-300",
-                loading && "opacity-50"
+                isAutoPilot ? "bg-indigo-600" : "bg-zinc-300",
+                isAutoPilotLoading && "opacity-50"
               )}
             >
               <div className={cn(
                 "absolute top-1 w-3 h-3 rounded-full bg-white transition-all duration-300",
-                autoPilot ? "left-6" : "left-1"
+                isAutoPilot ? "left-6" : "left-1"
               )} />
             </button>
           </div>
           <p className="text-[10px] text-zinc-500 leading-tight">
-            {autoPilot 
+            {isAutoPilot 
               ? "Automated execution is active. No human discretion required." 
               : "System is in Manual Mode. You must execute trades manually."}
           </p>

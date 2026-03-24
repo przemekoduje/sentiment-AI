@@ -47,7 +47,7 @@ const Alerts = ({ onTickerNavigate }: AlertsProps) => {
 
   const fetchAlerts = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/live/alerts');
+      const res = await fetch('/api/live/alerts');
       const data = await res.json();
       setAlerts(data.alerts || []);
     } catch (err) {

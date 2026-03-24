@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import { Treemap, ResponsiveContainer, Tooltip } from 'recharts'
 import { db } from '@/lib/firebase'
-import { collection, onSnapshot, query, limit } from 'firebase/firestore'
+import { doc, onSnapshot } from 'firebase/firestore'
 import { cn } from '@/lib/utils'
 import { Activity, ShieldCheck, ShieldAlert, Clock, Info } from 'lucide-react'
 
@@ -43,14 +43,14 @@ const CustomContent = (props: any) => {
         }}
         className="hover:opacity-80 transition-opacity"
       />
-      {width > 28 && height > 20 && (
+      {width > 12 && height > 10 && (
         <text
           x={x + width / 2}
           y={y + height / 2}
           textAnchor="middle"
           dominantBaseline="middle"
           fill="#fff"
-          fontSize={Math.min(width / 4, 11)}
+          fontSize={Math.max(5, Math.min(width / 4, 10))}
           fontWeight="900"
           className="pointer-events-none select-none font-sans"
         >
@@ -68,31 +68,47 @@ export default function SentimentHeatmap({ onTickerSelect }: SentimentHeatmapPro
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null)
 
   useEffect(() => {
-    const q = query(collection(db, 'sp500_heatmap'), limit(500))
+    // WDROŻENIE: Single-Object State (The Big Blob)
+    // Subskrybujemy jeden dokument zamiast całej kolekcji.
+    const docRef = doc(db, 'global_market_state', 'all_tickers')
     
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const deduplicated = new Map<string, MarketNode>()
+    const unsubscribe = onSnapshot(docRef, (snapshot) => {
+      if (!snapshot.exists()) {
+        // Jeśli dokument jeszcze nie istnieje (zimny start), czekamy na pierwszy flush backendu
+        return
+      }
+
+      const { tickers = [] } = snapshot.data() as { tickers: any[] }
       
-      snapshot.docs.forEach(doc => {
-        const d = doc.data()
+      // WDROŻENIE: Grupowanie po sektorach (Bloomberg Terminal Style)
+      const sectorsMap = new Map<string, any>()
+      
+      tickers.forEach(d => {
         if (!d.ticker) return
         
-        const rawSize = d.size && d.size > 0 ? d.size : (Math.abs(d.change_pct || 0) + 1)
-        const nodeWeight = Math.log10(Math.max(rawSize, 100)) * 10
+        const sector = d.sector || "Other"
+        if (!sectorsMap.has(sector)) {
+          sectorsMap.set(sector, {
+            name: sector,
+            children: []
+          })
+        }
         
-        deduplicated.set(d.ticker, {
+        const rawSize = Number(d.size) || 1000000000 // 1B fallback
+        
+        sectorsMap.get(sector).children.push({
           name: d.ticker,
           ticker: d.ticker,
           price: Number(d.price) || 0,
           change_pct: Number(d.change_pct) || 0,
           sentiment_score: Number(d.sentiment) || 0,
           size: rawSize,
-          weight: isNaN(nodeWeight) ? 1 : nodeWeight
+          sector: sector
         })
       })
 
-      const nodes = Array.from(deduplicated.values())
-      setData(nodes.sort((a, b) => b.weight - a.weight))
+      const hierarchicalData = Array.from(sectorsMap.values())
+      setData(hierarchicalData)
       setLoading(false)
       setStatus('connected')
       setLastUpdate(new Date())
@@ -177,8 +193,8 @@ export default function SentimentHeatmap({ onTickerSelect }: SentimentHeatmapPro
         <ResponsiveContainer width="100%" height={500}>
           <Treemap
             data={data}
-            dataKey="weight"
-            nameKey="ticker"
+            dataKey="size"
+            nameKey="name"
             stroke="#fff"
             content={<CustomContent onTickerSelect={onTickerSelect} />}
           >
@@ -191,16 +207,20 @@ export default function SentimentHeatmap({ onTickerSelect }: SentimentHeatmapPro
                       <div className="flex items-center justify-between gap-8 mb-4">
                         <p className="text-sm font-black text-zinc-900">{d.ticker}</p>
                         <div className="px-2 py-0.5 bg-zinc-50 rounded-md border border-zinc-100">
-                           <span className="text-[8px] font-black text-zinc-500 uppercase">S&P 500</span>
+                           <span className="text-[8px] font-black text-zinc-500 uppercase">{d.sector || 'S&P 500'}</span>
                         </div>
                       </div>
                       <div className="space-y-3">
+                        <div className="flex items-center justify-between gap-6">
+                           <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-tight">Cap</span>
+                           <span className="text-xs font-black text-zinc-900">${((d.size || 0) / 1e9).toFixed(1)}B</span>
+                        </div>
                         <div className="flex items-center justify-between gap-6">
                            <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-tight">Quote</span>
                            <span className="text-xs font-black text-zinc-900">${(d.price || 0).toFixed(2)}</span>
                         </div>
                         <div className="flex items-center justify-between gap-6">
-                           <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-tight">24H Flux</span>
+                           <span className="text-[9px] font-bold text-zinc-400 uppercase tracking-tight">Flux (24H Change)</span>
                            <span className={cn(
                              "text-xs font-black",
                              (d.change_pct || 0) >= 0 ? "text-emerald-600" : "text-red-500"

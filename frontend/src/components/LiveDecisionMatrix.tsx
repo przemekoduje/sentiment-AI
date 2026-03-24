@@ -50,7 +50,7 @@ export default function LiveDecisionMatrix({ filterHighConf }: { filterHighConf?
 
   const fetchMatrix = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/live/matrix')
+      const res = await fetch('/api/live/matrix')
       if (!res.ok) {
         console.error(`Matrix API Error: ${res.status} ${res.statusText}`)
         setLoading(false)

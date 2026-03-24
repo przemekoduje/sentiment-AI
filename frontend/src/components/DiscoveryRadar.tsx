@@ -28,7 +28,7 @@ import {
 import { cn } from '@/lib/utils'
 
 interface LiveSignal {
-  symbol: string
+  ticker: string
   company: string
   action: 'BUY' | 'SELL'
   size: number
@@ -38,6 +38,7 @@ interface LiveSignal {
   status: 'FILLED' | 'PENDING' | 'ERROR' | 'LIVE'
   insider_score?: number
   fundamental_grade?: string
+  signal_id?: number
 }
 
 export default function DiscoveryRadar({ 
@@ -56,7 +57,7 @@ export default function DiscoveryRadar({
   const [signals, setSignals] = useState<LiveSignal[]>([])
   const [loading, setLoading] = useState(true)
   const [isScanning, setIsScanning] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [radarError, setRadarError] = useState<string | null>(null)
   const [performance, setPerformance] = useState<any>({
     total_trades_24h: 0,
     win_rate: 0,
@@ -74,16 +75,25 @@ export default function DiscoveryRadar({
   const [manualAction, setManualAction] = useState<'BUY' | 'SELL'>('BUY')
 
   const fetchDiscovery = async () => {
-    setLoading(true)
-    setError(null)
+    if (loading && !signals.length) setLoading(true)
+    
+    // Simple Circuit Breaker to avoid spamming console
+    if ((window as any)._last_fetch_failed && Date.now() - (window as any)._last_fetch_failed < 15000) {
+      return
+    }
+
     try {
       const [res, perfRes] = await Promise.all([
-        fetch('http://localhost:8000/api/live/discovery?limit=30'),
-        fetch('http://localhost:8000/api/live/performance')
+        fetch('/api/live/discovery?limit=30'),
+        fetch('/api/live/performance')
       ])
 
-      if (!res.ok || !perfRes.ok) throw new Error("Failed to fetch data from API")
+      if (!res.ok || !perfRes.ok) {
+        setRadarError("API Offline")
+        return
+      }
       
+      (window as any)._last_fetch_failed = null
       const data = await res.json()
       const perfData = await perfRes.json()
       
@@ -95,7 +105,7 @@ export default function DiscoveryRadar({
         setSignals(prev => {
           const dismissed = JSON.parse(localStorage.getItem('dismissed_signals') || '[]') as string[]
           const dismissedUpper = dismissed.map((s: string) => s.toUpperCase())
-          return prev.filter(s => (s as any).isManual && !dismissedUpper.includes(s.symbol.toUpperCase()))
+          return prev.filter(s => (s as any).isManual && s.ticker && !dismissedUpper.includes(s.ticker.toUpperCase()))
         })
       } else {
         setIsScanning(false)
@@ -106,17 +116,18 @@ export default function DiscoveryRadar({
           const dismissed = JSON.parse(localStorage.getItem('dismissed_signals') || '[]') as string[]
           const dismissedUpper = dismissed.map((s: string) => s.toUpperCase())
           
-          const visibleNewSignals = newSignals.filter((s: any) => !dismissedUpper.includes(s.symbol.toUpperCase()))
+          const visibleNewSignals = newSignals.filter((s: any) => s.ticker && !dismissedUpper.includes(s.ticker.toUpperCase()))
           
-          const manualOnly = prev.filter(s => (s as any).isManual && !dismissedUpper.includes(s.symbol.toUpperCase()))
-          const filteredManual = manualOnly.filter(ms => !visibleNewSignals.some((ds: any) => ds.symbol.toUpperCase() === ms.symbol.toUpperCase()))
+          const manualOnly = prev.filter(s => (s as any).isManual && s.ticker && !dismissedUpper.includes(s.ticker.toUpperCase()))
+          const filteredManual = manualOnly.filter(ms => !visibleNewSignals.some((ds: any) => (ds.ticker || "").toUpperCase() === ms.ticker.toUpperCase()))
           
           return [...visibleNewSignals, ...filteredManual]
         })
       }
     } catch (err) {
-      console.error(err)
-      setError("Market scan failed. Please check backend connection.")
+      console.warn("API Connection Lost: Auto-Pilot & Matrix Polling Gated (15s)")
+      setRadarError(null) // Don't show scary error to user
+      ;(window as any)._last_fetch_failed = Date.now()
     } finally {
       setLoading(false)
     }
@@ -124,8 +135,8 @@ export default function DiscoveryRadar({
 
   const exportToCSV = () => {
     if (signals.length === 0) return
-    const headers = ["Symbol", "Action", "Price", "Confidence", "Status"]
-    const rows = signals.map(s => [s.symbol, s.action, s.price, s.confidence, s.status])
+    const headers = ["Ticker", "Action", "Price", "Confidence", "Status"]
+    const rows = signals.map(s => [s.ticker, s.action, s.price, s.confidence, s.status])
     const csvContent = [headers.join(","), ...rows.map(e => e.join(","))].join("\n")
     
     // Visual feedback
@@ -149,15 +160,20 @@ export default function DiscoveryRadar({
       try {
         const parsed = JSON.parse(savedManual) as LiveSignal[]
 
-        // Clear symbols of loaded manual signals from the dismissed_signals blacklist
+        // Clear tickers of loaded manual signals from the dismissed_signals blacklist
         let dismissed = JSON.parse(localStorage.getItem('dismissed_signals') || '[]') as string[]
-        const manualSymbols = parsed.map(s => s.symbol)
-        const newDismissed = dismissed.filter(s => !manualSymbols.includes(s))
-        if (newDismissed.length !== dismissed.length) { // Only update if changes were made
+        const manualTickers = parsed.filter(s => s && s.ticker).map(s => s.ticker)
+        const newDismissed = dismissed.filter(s => !manualTickers.includes(s))
+        if (newDismissed.length !== dismissed.length) {
           localStorage.setItem('dismissed_signals', JSON.stringify(newDismissed))
         }
 
-        setSignals(prev => [...prev, ...parsed])
+        setSignals(prev => {
+          // De-duplicate: Keep existing signals, add manual ones only if ticker present and not a duplicate
+          const existingTickers = new Set(prev.filter(s => s && s.ticker).map(s => s.ticker))
+          const uniqueManual = parsed.filter(s => s && s.ticker && !existingTickers.has(s.ticker))
+          return [...prev, ...uniqueManual]
+        })
       } catch (e) {
         console.error("Failed to load manual signals:", e)
       }
@@ -167,21 +183,7 @@ export default function DiscoveryRadar({
     // Refresh every 5 minutes
     const interval = setInterval(fetchDiscovery, 300000)
     
-    // Poll Autopilot status for sync
-    const fetchAutoPilot = async () => {
-      try {
-        const res = await fetch('http://localhost:8000/api/autopilot')
-        const data = await res.json()
-        if (data.enabled !== isAutoPilot) {
-            setIsAutoPilot(data.enabled)
-        }
-      } catch (err) {
-        console.error("Autopilot sync error:", err)
-      }
-    }
-    fetchAutoPilot()
-    const autoInterval = setInterval(fetchAutoPilot, 5000)
-
+    // Polling is managed by MainLayout. This component just listens for changes via props.
     const handleToggleEvent = (e: any) => {
       setIsAutoPilot(e.detail)
     }
@@ -189,15 +191,14 @@ export default function DiscoveryRadar({
 
     return () => {
       clearInterval(interval)
-      clearInterval(autoInterval)
       window.removeEventListener('autopilot-toggle', handleToggleEvent)
     }
-  }, [])
+  }, [isAutoPilot])
 
   const toggleGlobalAutoPilot = async () => {
     const newState = !isAutoPilot
     try {
-      const res = await fetch(`http://localhost:8000/api/autopilot?enabled=${newState}`, { method: 'POST' })
+      const res = await fetch(`/api/autopilot?enabled=${newState}`, { method: 'POST' })
       if (res.ok) {
         setIsAutoPilot(newState)
         window.dispatchEvent(new CustomEvent('autopilot-toggle', { detail: newState }))
@@ -226,10 +227,10 @@ export default function DiscoveryRadar({
     return true
   })
 
-  const handleApprove = async (symbol: string) => {
+  const handleApprove = async (ticker: string) => {
     // Simulate approval
     setSignals(prev => prev.map(s => 
-      s.symbol === symbol ? { ...s, status: 'FILLED' as const } : s
+      s.ticker === ticker ? { ...s, status: 'FILLED' as const } : s
     ))
     // We could also call an API here if it existed, e.g. /api/live/execute
   }
@@ -246,7 +247,7 @@ export default function DiscoveryRadar({
     let price = 100.0
     let fundamental = 'B'
     try {
-      const res = await fetch(`http://localhost:8000/api/signals?ticker=${ticker}`)
+      const res = await fetch(`/api/signals?ticker=${ticker}`)
       if (res.ok) {
         const data = await res.json()
         price = data.current_price || 100.0
@@ -257,7 +258,7 @@ export default function DiscoveryRadar({
     }
 
     const manualSignal: LiveSignal = {
-      symbol: ticker,
+      ticker: ticker,
       company: "MANUAL OVERRIDE ENTRY",
       action: manualAction,
       size: 1.0,
@@ -270,10 +271,12 @@ export default function DiscoveryRadar({
     } as any
     
     setSignals(prev => {
+      // Avoid duplicate manual entries for the same ticker
+      if (prev.some(s => s.ticker.toUpperCase() === ticker.toUpperCase())) {
+        return prev
+      }
       const next = [manualSignal, ...prev]
-      // Save manual signals to local storage
-      const manualOnly = next.filter(s => (s as any).isManual)
-      localStorage.setItem('manual_radar_signals', JSON.stringify(manualOnly))
+      localStorage.setItem('manual_radar_signals', JSON.stringify(next.filter(s => (s as any).isManual)))
       return next
     })
     
@@ -281,20 +284,21 @@ export default function DiscoveryRadar({
     setManualTicker('')
   }
 
-  const handleBuy = async (symbol: string) => {
-    const signal = signals.find(s => s.symbol === symbol)
+  const handleBuy = async (ticker: string) => {
+    const signal = signals.find(s => s.ticker === ticker)
     if (!signal) return
 
     try {
-      const res = await fetch('http://localhost:8000/api/live/execute', {
+      const res = await fetch('/api/live/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          symbol: signal.symbol,
+          ticker: signal.ticker,
           price: signal.price,
           action: signal.action,
           sl_pct: 0.05, // Default 5%
-          tp_pct: 0.10  // Default 10%
+          tp_pct: 0.10, // Default 10%
+          signal_id: (signal as any).signal_id // Zero Trust: Pass DB ID
         })
       })
 
@@ -302,13 +306,13 @@ export default function DiscoveryRadar({
         // Remove from manual list and update status
         setSignals(prev => {
           const next = prev.map(s => 
-            s.symbol === symbol ? { ...s, status: 'FILLED' as any, isManual: false } : s
+            s.ticker === ticker ? { ...s, status: 'FILLED' as any, isManual: false } : s
           )
           const manualOnly = next.filter(s => (s as any).isManual)
           localStorage.setItem('manual_radar_signals', JSON.stringify(manualOnly))
           return next
         })
-        console.log(`>>> Manual BUY executed for ${symbol}`)
+        console.log(`>>> Manual BUY executed for ${ticker}`)
       } else {
         const err = await res.json()
         alert(`Failed to execute trade: ${err.detail || 'Insufficient capital'}`)
@@ -318,17 +322,17 @@ export default function DiscoveryRadar({
     }
   }
 
-  const handleRemoveSignal = (symbol: string) => {
-    if (window.confirm(`Remove ${symbol} from the pending radar?`)) {
+  const handleRemoveSignal = (ticker: string) => {
+    if (window.confirm(`Remove ${ticker} from the pending radar?`)) {
       // 1. Add to blacklist to prevent re-appearance from scan
       const dismissed = JSON.parse(localStorage.getItem('dismissed_signals') || '[]')
-      if (!dismissed.includes(symbol)) {
-        localStorage.setItem('dismissed_signals', JSON.stringify([...dismissed, symbol]))
+      if (!dismissed.includes(ticker)) {
+        localStorage.setItem('dismissed_signals', JSON.stringify([...dismissed, ticker]))
       }
 
       // 2. Clear from state
       setSignals(prev => {
-        const next = prev.filter(s => s.symbol !== symbol)
+        const next = prev.filter(s => s.ticker !== ticker)
         // Update local storage for manual signals
         const manualOnly = next.filter(s => (s as any).isManual)
         localStorage.setItem('manual_radar_signals', JSON.stringify(manualOnly))
@@ -337,18 +341,31 @@ export default function DiscoveryRadar({
     }
   }
 
-  const handleEmergencyClose = (symbol: string) => {
-    if (window.confirm(`DANGER: Are you sure you want to EMERGENCY CLOSE ${symbol}? This will immediately exit the position.`)) {
-      // 1. Find and update the signal to CLOSED
-      setSignals(prev => prev.map(s => 
-        s.symbol === symbol ? { ...s, status: 'CLOSED' as any } : s
-      ))
-      // In a real app, we'd also trigger an API call to close the position
-      console.warn(`>>> EMERGENCY CLOSE EXECUTED for ${symbol}`)
+  const handleEmergencyClose = async (ticker: string) => {
+    if (window.confirm(`DANGER: Are you sure you want to EMERGENCY CLOSE ${ticker}? This will immediately exit the position.`)) {
+      try {
+        const res = await fetch(`/api/portfolio/close?ticker=${ticker}`, {
+          method: 'POST'
+        })
+        
+        if (res.ok) {
+          // Update the signal to CLOSED in UI
+          setSignals(prev => prev.map(s => 
+            s.ticker === ticker ? { ...s, status: 'CLOSED' as any } : s
+          ))
+          console.log(`>>> EMERGENCY CLOSE SUCCESS for ${ticker}`)
+        } else {
+          const err = await res.json()
+          alert(`Failed to close position: ${err.detail || 'Unknown error'}`)
+        }
+      } catch (e) {
+        console.error("Emergency close error:", e)
+        alert("Failed to communicate with server for emergency close.")
+      }
     }
   }
 
-  if (isScanning && !error) {
+  if (isScanning && !radarError) {
     return (
       <div className="flex flex-col items-center justify-center h-[500px] bg-white rounded-[40px] border border-zinc-100 p-12 shadow-sm relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-b from-indigo-50/20 to-transparent opacity-50" />
@@ -370,12 +387,12 @@ export default function DiscoveryRadar({
     )
   }
 
-  if (error) {
+  if (radarError) {
     return (
       <div className="flex flex-col items-center justify-center h-[400px] bg-white rounded-3xl border border-red-100 p-8 shadow-sm">
         <AlertTriangle className="w-12 h-12 text-red-500 mb-4 opacity-50" />
         <h3 className="text-xl font-black text-zinc-900 mb-2">System Interrupted</h3>
-        <p className="text-zinc-500 mb-6 text-center max-w-sm">{error}</p>
+        <p className="text-zinc-500 mb-6 text-center max-w-sm">{radarError}</p>
         <button 
           onClick={fetchDiscovery}
           className="bg-indigo-600 text-white px-6 py-2 rounded-xl text-sm font-bold shadow-lg shadow-indigo-100"
@@ -511,22 +528,22 @@ export default function DiscoveryRadar({
             </thead>
             <tbody className="divide-y divide-zinc-50">
               {filteredSignals.map((signal, i) => (
-                <tr 
-                  key={i} 
-                  className="group hover:bg-zinc-50/50 transition-all cursor-pointer"
-                  onClick={() => onTickerChange(signal.symbol)}
-                >
-                  <td className="px-8 py-5">
-                    <div className="flex items-center gap-4">
-                      <div className="w-10 h-10 rounded-xl bg-zinc-100 flex items-center justify-center text-xs font-bold text-zinc-500 ring-1 ring-zinc-200 group-hover:ring-indigo-200 group-hover:bg-indigo-50 transition-all group-hover:text-indigo-600">
-                        {signal.symbol?.substring(0, 2) || "??"}
+                  <tr 
+                    key={i} 
+                    className="group hover:bg-zinc-50/50 transition-all cursor-pointer"
+                    onClick={() => onTickerChange(signal.ticker)}
+                  >
+                    <td className="px-8 py-5">
+                      <div className="flex items-center gap-4">
+                        <div className="w-10 h-10 rounded-xl bg-zinc-100 flex items-center justify-center text-xs font-bold text-zinc-500 ring-1 ring-zinc-200 group-hover:ring-indigo-200 group-hover:bg-indigo-50 transition-all group-hover:text-indigo-600">
+                          {signal.ticker?.substring(0, 2) || "??"}
+                        </div>
+                        <div>
+                          <p className="text-sm font-black text-zinc-900 leading-none">{signal.ticker || "UNKNOWN"}</p>
+                          <p className="text-[10px] text-zinc-400 font-medium mt-1">{signal.company || "Company Info N/A"}</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-sm font-black text-zinc-900 leading-none">{signal.symbol || "UNKNOWN"}</p>
-                        <p className="text-[10px] text-zinc-400 font-medium mt-1">{signal.company || "Company Info N/A"}</p>
-                      </div>
-                    </div>
-                  </td>
+                    </td>
                   <td className="px-6 py-5">
                     <div className={cn(
                       "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black",
@@ -585,7 +602,7 @@ export default function DiscoveryRadar({
                         <button 
                           onClick={(e) => {
                             e.stopPropagation()
-                            handleEmergencyClose(signal.symbol)
+                            handleEmergencyClose(signal.ticker)
                           }}
                           className="bg-red-50 text-red-600 p-1.5 rounded-lg border border-red-100 hover:bg-red-600 hover:text-white transition-all shadow-sm active:scale-95 group relative"
                           title="Close Position"
@@ -599,11 +616,11 @@ export default function DiscoveryRadar({
 
                       {signal.status === 'PENDING' && (
                          <div className="flex items-center gap-2">
-                           {!isAutoPilot && (
+                           {(!isAutoPilot || (signal as any).isManual) && (
                              <button 
                               onClick={(e) => {
                                 e.stopPropagation()
-                                handleBuy(signal.symbol)
+                                handleBuy(signal.ticker)
                               }}
                               className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-1.5 rounded-xl shadow-lg shadow-emerald-100 transition-all hover:scale-105 active:scale-95 flex items-center gap-2"
                             >
@@ -615,7 +632,7 @@ export default function DiscoveryRadar({
                           <button 
                             onClick={(e) => {
                               e.stopPropagation()
-                              handleRemoveSignal(signal.symbol)
+                              handleRemoveSignal(signal.ticker)
                             }}
                             className="bg-zinc-100 hover:bg-zinc-200 text-zinc-500 p-1.5 rounded-lg border border-zinc-200 transition-all active:scale-95 shadow-sm"
                             title="Remove from Radar"

@@ -1,5 +1,6 @@
 import os
 import traceback
+from typing import Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
@@ -21,6 +22,7 @@ from .modules.sentiment_bridge import fetch_news_sentiment, aggregate_sentiment_
 from .modules.backtester import BacktestEngine
 from .modules.bulk_backtester import BulkBacktester
 from .modules.portfolio_manager import PortfolioManager
+from .database import TradeSignal, save_signal, get_signal_by_id, create_db_and_tables
 from pydantic import BaseModel
 from .modules.yf_manager import safe_download
 import asyncio
@@ -41,7 +43,15 @@ app = FastAPI(title="Sentiment AI Trading Engine")
 # Init discovery engine once for global cache
 discovery_engine = LiveDiscoveryEngine()
 portfolio = PortfolioManager(initial_capital=10000.0)
-AUTO_PILOT_ENABLED = False # Master switch for automated execution
+
+# Initialize PostgreSQL Tables
+try:
+    from .database import create_db_and_tables, get_portfolio_settings
+    create_db_and_tables()
+    get_portfolio_settings() # Initialize default settings row if missing
+    print("PostgreSQL Tables Synced & Initialized.")
+except Exception as e:
+    print(f"DB Init Warning: {e}")
 
 # --- Background Market Monitor (Production Scaling) ---
 async def market_monitor_loop():
@@ -56,8 +66,8 @@ async def market_monitor_loop():
             
             # Okresowy flush heatmapy (co 30 min)
             if (datetime.now() - last_flush).total_seconds() > 1800:
-                from .modules.firebase_helper import flush_heatmap_batch
-                flush_heatmap_batch()
+                from .modules.firebase_helper import flush_heatmap_single_object
+                flush_heatmap_single_object()
                 last_flush = datetime.now()
             
             # 2. Monitorowanie otwartych pozycji (Automatyczne Wyjście)
@@ -69,8 +79,10 @@ async def market_monitor_loop():
                     data = await asyncio.to_thread(safe_download, position_tickers, period="1d", interval="1m", progress=False)
                     if not data.empty:
                         for ticker in position_tickers:
+                            # Re-check if ticker still in positions (concurrency safety)
+                            if ticker not in portfolio.positions: continue
+                            
                             pos = portfolio.positions[ticker]
-                            # Handle single-ticker vs multi-ticker results from yfinance robustly
                             try:
                                 if isinstance(data['Close'], pd.DataFrame):
                                     if ticker in data['Close'].columns:
@@ -80,31 +92,36 @@ async def market_monitor_loop():
                                 else: # Series
                                     current_price = float(data['Close'].iloc[-1])
                             except Exception:
-                                print(f">>> Skip check for {ticker}: Price data unavailable")
                                 continue
                             
                             if current_price <= pos['sl']:
-                                portfolio.close_position(ticker, current_price, current_time, "STOP_LOSS (AUTO)")
+                                await portfolio.close_position(ticker, current_price, current_time, "STOP_LOSS (AUTO)")
                                 print(f"AUTO_PILOT: Closed {ticker} at ${current_price} due to STOP_LOSS")
                             elif current_price >= pos['tp']:
-                                portfolio.close_position(ticker, current_price, current_time, "TAKE_PROFIT (AUTO)")
+                                await portfolio.close_position(ticker, current_price, current_time, "TAKE_PROFIT (AUTO)")
                                 print(f"AUTO_PILOT: Closed {ticker} at ${current_price} due to TAKE_PROFIT")
                 except Exception as e:
                     print(f"Auto-Pilot Monitor Error (Exit Check): {e}")
 
             # 3. Automatyczne otwarcie (Auto-Pilot Entry)
-            if AUTO_PILOT_ENABLED:
+            if portfolio.auto_pilot_enabled:
                 signals = discovery_engine.get_cached_signals()
                 current_time = datetime.now().isoformat()
-                for signal in signals:
-                    ticker = signal['symbol']
-                    if signal['action'] == "BUY" and ticker not in portfolio.positions:
-                        entry_price = signal['price']
+                # Sort signals by confidence/kelly for prioritization
+                for signal in sorted(signals, key=lambda x: x.get('kelly_fraction', 0), reverse=True):
+                    ticker = signal.get('ticker') or signal.get('symbol')
+                    if not ticker: continue
+                    
+                    if signal.get('action') == "BUY" and ticker not in portfolio.positions:
+                        entry_price = signal.get('price', 0)
+                        if entry_price <= 0: continue
                         sl = entry_price * 0.95
                         tp = entry_price * 1.10
-                        success = portfolio.open_position(
+                        
+                        success = await portfolio.open_position(
                             ticker=ticker, entry_price=entry_price, entry_time=current_time,
-                            sl=sl, tp=tp, sl_pct=0.05
+                            sl=sl, tp=tp, sl_pct=0.05,
+                            kelly_fraction=signal.get('kelly_fraction', 0.02)
                         )
                         if success:
                             print(f"AUTO_PILOT: Executed BUY for {ticker} at ${entry_price}")
@@ -147,17 +164,21 @@ async def price_sync_loop():
 async def startup_event():
     # 1. Inicjalizacja danych statycznych (Market Caps)
     from .modules.market_cap_provider import MarketCapProvider
-    asyncio.create_task(MarketCapProvider.refresh_caps())
-
-    # 2. Uruchamiamy monitor w tle
+    # Start background tasks with priority for Discovery
     asyncio.create_task(market_monitor_loop())
+    
+    # Delay market cap refresh to avoid yf deadlock at startup
+    async def delayed_caps():
+        await asyncio.sleep(15) 
+        await MarketCapProvider.refresh_caps()
+    asyncio.create_task(delayed_caps())
     # Uruchamiamy szybką synchronizację cen
     asyncio.create_task(price_sync_loop())
     
     # 3. Natychmiastowe wypełnienie heatmapy (Initial Flush)
     try:
-        from .modules.firebase_helper import flush_heatmap_batch
-        asyncio.create_task(asyncio.to_thread(flush_heatmap_batch))
+        from .modules.firebase_helper import flush_heatmap_single_object
+        asyncio.create_task(asyncio.to_thread(flush_heatmap_single_object))
     except Exception as e:
         print(f"!!! Startup Heatmap Flush Error: {e}")
 
@@ -203,15 +224,53 @@ async def trigger_demo():
 
 @app.get("/api/autopilot")
 async def get_autopilot_status():
-    return {"enabled": AUTO_PILOT_ENABLED}
+    from .database import get_portfolio_settings
+    settings = await asyncio.to_thread(get_portfolio_settings)
+    return {"enabled": settings.auto_pilot_enabled}
 
 @app.post("/api/autopilot")
 async def toggle_autopilot(enabled: bool = Query(...)):
-    global AUTO_PILOT_ENABLED
-    AUTO_PILOT_ENABLED = enabled
+    from .database import update_portfolio_settings
+    await asyncio.to_thread(update_portfolio_settings, auto_pilot=enabled)
+    portfolio.refresh_state()
     state = "ENABLED" if enabled else "DISABLED"
     print(f">>> AUTO-PILOT {state}")
-    return {"status": "updated", "enabled": AUTO_PILOT_ENABLED}
+    return {"status": "updated", "enabled": enabled}
+
+@app.post("/api/portfolio/close")
+async def close_trade(ticker: str = Query(...)):
+    """
+    Emergency Close Endpoint (User Initiated).
+    """
+    from .modules.yf_manager import safe_download
+    try:
+        # Optimization: Try to get price from discovery engine cache first (much faster)
+        cached_data = discovery_engine.get_matrix_data()
+        ticker_data = next((item for item in cached_data if item['ticker'] == ticker), None)
+        
+        current_price = 0.0
+        if ticker_data and ticker_data.get('price'):
+            current_price = float(ticker_data['price'])
+            print(f">>> Fast-Close: Using cached price for {ticker}: {current_price}")
+        else:
+            # Fallback to fresh download (only if not in cache)
+            data = await asyncio.to_thread(safe_download, [ticker], period="1d", interval="1m", progress=False)
+            if data.empty or 'Close' not in data.columns:
+                raise HTTPException(status_code=400, detail="Cannot fetch current price for closing.")
+            current_price = float(data['Close'].iloc[-1])
+            print(f">>> Standard-Close: Fetched fresh price for {ticker}: {current_price}")
+        if math.isnan(current_price) or math.isinf(current_price):
+            raise HTTPException(status_code=400, detail="Current price is NaN/Inf, cannot close position.")
+            
+        success = await portfolio.close_position(ticker, current_price, datetime.now().isoformat(), "MANUAL_CLOSE")
+        
+        if success:
+            return {"status": "success", "message": f"Closed {ticker} at {current_price}"}
+        else:
+            raise HTTPException(status_code=400, detail="Failed to close position (maybe already closed).")
+    except Exception as e:
+        print(f"!!! Emergency Close Error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/markets/tickers")
 async def get_market_tickers():
@@ -225,29 +284,39 @@ async def get_market_tickers():
     }
 
 @app.get("/api/live/performance")
-
 async def get_live_performance():
     """
-    Zwraca aktualne statystyki portfela na żywo.
+    Zwraca aktualne statystyki portfela na żywo z bazy danych.
     """
-    total_trades = len(portfolio.trade_log)
-    win_rate = 0
-    if total_trades > 0:
-        wins = len([t for t in portfolio.trade_log if t['pnl'] > 0])
-        win_rate = (wins / total_trades) * 100
+    from .database import get_trade_history, Session, engine, select, TradeLog
     
-    # Oblicz Net P&L (zamknięte + otwarte)
-    current_prices = {s['symbol']: s['price'] for s in discovery_engine.get_cached_signals()}
-    total_equity = portfolio.update_equity(current_prices, datetime.now().isoformat())
-    net_pnl = total_equity - portfolio.initial_capital
+    with Session(engine) as session:
+        all_trades = session.exec(select(TradeLog)).all()
+        total_trades = len(all_trades)
+        wins = len([t for t in all_trades if t.pnl > 0])
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+        
+        # Ostatnie 10 dla logu
+        last_trades = all_trades[-10:] if all_trades else []
 
-    return {
+    # Oblicz Net P&L (zamknięte + otwarte)
+    try:
+        # Use .get('ticker') for resilience
+        current_prices = {s.get('ticker') or s.get('symbol'): s.get('price', 0) for s in discovery_engine.get_cached_signals()}
+        summary = portfolio.get_financial_summary(current_prices)
+        net_pnl = summary['equity'] - portfolio.initial_capital
+    except Exception as e:
+        print(f"!!! Error calculating live performance: {e}")
+        summary = {"equity": portfolio.initial_capital, "position_count": 0}
+        net_pnl = 0.0
+
+    return sanitize_nan({
         "total_trades_24h": total_trades,
-        "win_rate": sanitize_nan(win_rate, 0.0),
-        "net_pnl": sanitize_nan(net_pnl, 0.0),
-        "active_positions_count": len(portfolio.positions),
-        "trade_log": sanitize_nan(portfolio.trade_log[-10:]) # Ostatnie 10 transakcji
-    }
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "active_positions_count": summary['position_count'],
+        "trade_log": [t.dict() for t in last_trades]
+    })
 
 @app.get("/api/live/discovery")
 async def discovery():
@@ -260,11 +329,11 @@ async def discovery():
             return {"status": "scanning", "message": "Initial market scan in progress...", "signals": []}
             
         signals = discovery_engine.get_cached_signals()
-        return {
+        return sanitize_nan({
             "status": "active",
             "timestamp": datetime.now().isoformat(),
             "signals": signals
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -297,16 +366,18 @@ async def get_live_alerts():
     """
     try:
         alerts = discovery_engine.get_alerts()
-        return {
+        return sanitize_nan({
             "status": "active",
             "timestamp": datetime.now().isoformat(),
             "alerts": alerts
-        }
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/signals")
 async def get_signals(ticker: str = "AAPL"):
+    if ticker == "ALL":
+        return {"status": "error", "message": "Global signals not supported yet. Select a specific ticker."}
     """
     Merging technical signals with AI sentiment.
     Uses background cache if available for faster response.
@@ -320,28 +391,28 @@ async def get_signals(ticker: str = "AAPL"):
 
         if ticker_cache:
             # Reconstruct response from cache
-            return {
+            return sanitize_nan({
                 "ticker": ticker,
-                "current_price": sanitize_nan(ticker_cache['price']),
-                "change_pct": sanitize_nan(ticker_cache.get('change_pct', 0)),
+                "current_price": ticker_cache['price'],
+                "change_pct": ticker_cache.get('change_pct', 0),
                 "signal": "BULLISH" if ticker_cache['sma5'] > ticker_cache['sma20'] else "NEUTRAL",
-                "confidence": sanitize_nan(ticker_cache['potential'] / 100),
+                "confidence": ticker_cache['potential'] / 100,
                 "sentiment_label": ticker_cache['sentiment_label'],
                 "sentiment_score": ticker_cache.get('sentiment_score', 0),
                 "local_sentiment_label": ticker_cache.get('local_sentiment_label', "---"),
                 "local_sentiment_score": ticker_cache.get('local_sentiment_score', 0),
                 "technical_signal": "BULLISH" if ticker_cache['sma5'] > ticker_cache['sma20'] else "NEUTRAL",
                 "technical_indicators": {
-                    "sma5": sanitize_nan(ticker_cache['sma5']),
-                    "sma20": sanitize_nan(ticker_cache['sma20']),
-                    "rsi": sanitize_nan(ticker_cache['rsi'], fallback=50.0)
+                    "sma5": ticker_cache['sma5'],
+                    "sma20": ticker_cache['sma20'],
+                    "rsi": ticker_cache.get('rsi', 50.0)
                 },
                 "formations": [],
                 "reasoning": "Data retrieved from background market scan cache.",
                 "is_confident": ticker_cache['potential'] > 60,
                 "news_feed": ticker_cache.get('news_feed', []),
                 "timestamp": datetime.now().isoformat()
-            }
+            })
 
         # Fallback to on-demand fetch if not in cache
         # 1. Get Technical Signal (now returns a detailed dict)
@@ -477,6 +548,10 @@ async def get_trade_chart(
         # Flatten columns if MultiIndex (yf v0.2.40+ behavior)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
+            
+        # Ensure unique index and sorted dates (Fix for lightweight-charts crash)
+        data = data[~data.index.duplicated(keep='first')]
+        data = data.sort_index()
         
         # Ensure we have a Close column and it's 1D
         if 'Close' not in data.columns:
@@ -605,53 +680,65 @@ async def get_portfolio_status():
     # Use latest prices from cache for ROI and equity
     price_map = {item['ticker']: item['price'] for item in _matrix_cache}
     
+    from .database import get_trade_history
     financials = portfolio.get_financial_summary(price_map)
     # Use dummy market sentiment if not calculated
-    advice = portfolio.get_daily_advice(0.75) 
+    advice = portfolio.get_daily_advice(0.75) if hasattr(portfolio, 'get_daily_advice') else "Monitor conditions."
     
     return sanitize_nan({
         **financials,
         "advice": advice,
         "positions": portfolio.positions,
-        "trade_log": portfolio.trade_log[-20:], # Last 20 trades
-        "equity_curve": portfolio.equity_curve[-30:], # Last 30 points
+        "trade_log": get_trade_history(20), # Last 20 trades from DB
+        "equity_curve": [], # Placeholder or from DB if implemented
         "settings": {
             "initial_capital": portfolio.initial_capital,
-            "risk_per_trade": portfolio.risk_per_trade
+            "risk_per_trade": getattr(portfolio, 'risk_per_trade', 0.02)
         }
     })
 
 class TradeRequest(BaseModel):
-    symbol: str
+    ticker: str
     price: float
     action: str = "BUY"
     sl_pct: float = 0.05
     tp_pct: float = 0.10
+    signal_id: Optional[int] = None # Zero Trust identification
 
 @app.post("/api/live/execute")
 async def execute_manual_trade(req: TradeRequest):
     """
     Executes a manual trade from the Discovery Radar.
+    Zero Trust: Risk parameters are fetched from the database using signal_id.
     """
     try:
+        # Zero Trust Logic: Fetch Kelly from DB
+        kelly_to_use = 0.02 # Safe fallback
+        if req.signal_id:
+            db_signal = get_signal_by_id(req.signal_id)
+            if db_signal:
+                kelly_to_use = db_signal.kelly_fraction
+                print(f"ZERO TRUST: Verified Kelly Fraction {kelly_to_use} from Signal DB (ID: {req.signal_id})")
+        
         # Calculate SL/TP prices
         sl_price = req.price * (1 - req.sl_pct) if req.action == "BUY" else req.price * (1 + req.sl_pct)
         tp_price = req.price * (1 + req.tp_pct) if req.action == "BUY" else req.price * (1 - req.tp_pct)
         
-        success = portfolio.open_position(
-            ticker=req.symbol,
+        success = await portfolio.open_position(
+            ticker=req.ticker,
             entry_price=req.price,
             entry_time=datetime.now().isoformat(),
             sl=sl_price,
             tp=tp_price,
-            sl_pct=req.sl_pct
+            sl_pct=req.sl_pct,
+            kelly_fraction=kelly_to_use
         )
         
         if success:
-            return {"status": "success", "message": f"Position opened for {req.symbol}"}
-        else:
-            return {"status": "error", "message": "Insufficient capital or invalid parameters"}
+            return {"status": "success", "message": f"Trade executed for {req.ticker}", "kelly_used": kelly_to_use}
+        return {"status": "error", "message": "Failed to open position (insufficient funds or risk cap)"}
     except Exception as e:
+        print(f"Execution Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 class PortfolioSettings(BaseModel):
@@ -659,15 +746,18 @@ class PortfolioSettings(BaseModel):
     risk_per_trade: float
 
 @app.post("/api/portfolio/settings")
-async def update_portfolio_settings(settings: PortfolioSettings):
+async def update_portfolio_settings_endpoint(settings: PortfolioSettings):
     """
-    Updates global portfolio parameters.
+    Updates global portfolio parameters and persists to DB.
     """
-    portfolio.initial_capital = settings.initial_capital
-    portfolio.risk_per_trade = settings.risk_per_trade
-    # Also reset cash if capital changed significantly? 
-    # For now just update the params.
+    from .database import update_portfolio_settings as db_update
+    db_update(
+        initial_capital=settings.initial_capital,
+        risk_per_trade=settings.risk_per_trade
+    )
+    portfolio.refresh_state()
     return {"status": "success", "settings": settings}
 
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)

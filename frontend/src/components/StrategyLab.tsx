@@ -202,13 +202,13 @@ export default function StrategyLab({
     try {
       if (scannerMode) {
         const res = await fetch(
-          `http://localhost:8000/api/backtest/bulk?start_date=${sDate}&end_date=${eDate}&capital=${params.capital}&sl_pct=${params.sl/100}&tp_pct=${params.tp/100}&use_live_sentiment=${useLiveSentiment}&strategy_type=${params.strategyType}`
+          `/api/backtest/bulk?start_date=${sDate}&end_date=${eDate}&capital=${params.capital}&sl_pct=${params.sl/100}&tp_pct=${params.tp/100}&use_live_sentiment=${useLiveSentiment}&strategy_type=${params.strategyType}`
         )
         const data = await res.json()
         setBulkResults(data)
       } else {
         const res = await fetch(
-          `http://localhost:8000/api/backtest?ticker=${ticker}&start_date=${sDate}&end_date=${eDate}&capital=${params.capital}&sl=${params.sl/100}&tp=${params.tp/100}&use_live_sentiment=${useLiveSentiment}&strategy_type=${params.strategyType}`
+          `/api/backtest?ticker=${ticker}&start_date=${sDate}&end_date=${eDate}&capital=${params.capital}&sl=${params.sl/100}&tp=${params.tp/100}&use_live_sentiment=${useLiveSentiment}&strategy_type=${params.strategyType}`
         )
         const data = await res.json()
         setResults(data)

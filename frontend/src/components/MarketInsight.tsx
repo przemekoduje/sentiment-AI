@@ -47,7 +47,7 @@ export default function MarketInsight({ ticker, onTickerChange }: MarketInsightP
     const fetchInsight = async () => {
       setLoading(true)
       try {
-        const res = await fetch(`http://localhost:8000/api/signals?ticker=${ticker}`)
+        const res = await fetch(`/api/signals?ticker=${ticker}`)
         if (!res.ok) throw new Error("Failed to fetch insight")
         const result = await res.json()
         setData(result)

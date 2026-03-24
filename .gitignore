@@ -43,3 +43,9 @@ frontend/out/
 # Test artifacts
 /tmp/
 *.tmp
+
+# Backend Cache & Secrets
+backend/cache/
+backend/serviceAccountKey.json
+backend/app/modules/market_caps.json
+backend/server.log

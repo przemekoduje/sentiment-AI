@@ -1,4 +1,4 @@
-import yfinance as yf
+from .yf_manager import safe_download
 import pandas as pd
 
 def get_technical_indicator(ticker: str):
@@ -6,7 +6,8 @@ def get_technical_indicator(ticker: str):
     Computes detailed technical indicators and formations.
     """
     try:
-        data = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        # Use safe_download to avoid SQLite OperationalErrors during concurrent scans
+        data = safe_download(ticker, period="3mo", interval="1d", progress=False)
     except Exception as e:
         print(f"CRITICAL ERROR downloading data for {ticker}: {e}")
         return {"signal": "NEUTRAL", "price": 0.0, "indicators": {}, "formations": []}, 0.0

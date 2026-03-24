@@ -15,7 +15,7 @@ class MarketCapProvider:
 
     @classmethod
     def get_market_cap(cls, ticker: str) -> float:
-        """Returns market cap from cache, or fetches on-demand if missing."""
+        """Returns market cap from cache, or returns default if missing (non-blocking)."""
         if not cls._cache:
             cls.load_cache()
             
@@ -23,17 +23,8 @@ class MarketCapProvider:
         if cap is not None:
             return cap
             
-        # On-demand fetch for missing symbols (like COIN/PLTR if not in S&P 500)
-        try:
-            print(f">>> MarketCapProvider: On-demand fetch for {ticker}...")
-            info = yf.Ticker(ticker).fast_info
-            cap = info.get('marketCap')
-            if cap:
-                cls._cache[ticker] = float(cap)
-                return float(cap)
-        except Exception as e:
-            print(f"!!! MarketCapProvider: Error fetching {ticker} on-demand: {e}")
-            
+        # Optimization: Don't fetch on-demand during mass scans to avoid blocking.
+        # Background task MarketCapProvider.refresh_caps() will handle it.
         return 1000000000.0 # Default fallback (1B)
 
     @classmethod
@@ -67,17 +58,24 @@ class MarketCapProvider:
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i + chunk_size]
             try:
-                # yf.Tickers is faster for batch metadata
-                batch = yf.Tickers(" ".join(chunk))
-                for t in chunk:
-                    try:
-                        cap = batch.tickers[t].fast_info.get('marketCap')
-                        if cap:
-                            cls._cache[t] = float(cap)
-                    except Exception:
-                        continue
+                # yf.Tickers is blocking, we must run it in a thread to keep FastAPI responsive
+                def fetch_chunk():
+                    batch = yf.Tickers(" ".join(chunk))
+                    updates = {}
+                    for t in chunk:
+                        try:
+                            cap = batch.tickers[t].fast_info.get('marketCap')
+                            if cap:
+                                updates[t] = float(cap)
+                        except Exception:
+                            continue
+                    return updates
+                
+                chunk_updates = await asyncio.to_thread(fetch_chunk)
+                cls._cache.update(chunk_updates)
+                
                 print(f">>> MarketCapProvider: Progress {i+len(chunk)}/{len(tickers)}")
-                # Small sleep to be polite
+                # Small sleep to yield control
                 await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"!!! Batch error for chunk {chunk[0]}...: {e}")

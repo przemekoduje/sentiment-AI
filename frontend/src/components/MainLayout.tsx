@@ -19,6 +19,61 @@ export default function MainLayout() {
   const [activeTicker, setActiveTicker] = useState('AAPL')
   const [filterHighConf, setFilterHighConf] = useState(false)
   const [isAutoPilot, setIsAutoPilot] = useState(true)
+  const [isAutoPilotLoading, setIsAutoPilotLoading] = useState(false)
+  const [serverStatus, setServerStatus] = useState<'online' | 'offline'>('online')
+
+  // Sync Auto-Pilot with backend
+  React.useEffect(() => {
+    const fetchStatus = async () => {
+      // Circuit Breaker: Stop noise if server is offline
+      if (serverStatus === 'offline') {
+        const timeout = setTimeout(() => setServerStatus('online'), 15000)
+        return () => clearTimeout(timeout)
+      }
+
+      try {
+        const res = await fetch('/api/autopilot')
+        if (!res.ok) {
+           setServerStatus('offline')
+           return
+        }
+        const text = await res.text()
+        try {
+          const data = JSON.parse(text)
+          setServerStatus('online')
+          if (data.enabled !== isAutoPilot && !isAutoPilotLoading) {
+            setIsAutoPilot(data.enabled)
+          }
+        } catch (jsonErr) {
+          console.warn("Autopilot sync: Received non-JSON response.")
+          setServerStatus('offline')
+        }
+      } catch (err) {
+        setServerStatus('offline')
+      }
+    }
+    
+    fetchStatus()
+    const interval = setInterval(fetchStatus, 10000) // Increase to 10s for stability
+    return () => clearInterval(interval)
+  }, [isAutoPilot, isAutoPilotLoading, serverStatus])
+
+  const toggleAutoPilot = async () => {
+    setIsAutoPilotLoading(true)
+    const newState = !isAutoPilot
+    try {
+      const res = await fetch(`/api/autopilot?enabled=${newState}`, {
+        method: 'POST'
+      })
+      if (res.ok) {
+        setIsAutoPilot(newState)
+      }
+    } catch (err) {
+      console.error("Failed to toggle autopilot:", err)
+    } finally {
+      setIsAutoPilotLoading(false)
+    }
+  }
 
   const handleSearch = (ticker: string) => {
     setActiveTicker(ticker)
@@ -33,7 +88,13 @@ export default function MainLayout() {
   return (
     <div className="flex bg-[#FDFDFD] min-h-screen font-sans text-zinc-900">
       {/* Sidebar Navigation */}
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} />
+      <Sidebar 
+        activeTab={activeTab} 
+        setActiveTab={setActiveTab} 
+        isAutoPilot={isAutoPilot}
+        onAutoPilotToggle={toggleAutoPilot}
+        isAutoPilotLoading={isAutoPilotLoading}
+      />
       
       {/* Main Content Area */}
       <div className="flex-1 ml-64 flex flex-col">

@@ -21,13 +21,13 @@ export default function MarketSelector({ onMarketChange }: MarketSelectorProps) 
 
   useEffect(() => {
     // Fetch available markets
-    fetch('http://localhost:8000/api/markets')
+    fetch('/api/markets')
       .then(res => res.json())
       .then(data => setMarkets(data))
       .catch(err => console.error("Failed to fetch markets:", err))
 
     // Fetch current active market
-    fetch('http://localhost:8000/api/markets/active')
+    fetch('/api/markets/active')
       .then(res => res.json())
       .then(data => setActiveMarket(data.active_market))
       .catch(err => console.error("Failed to fetch active market:", err))
@@ -38,7 +38,7 @@ export default function MarketSelector({ onMarketChange }: MarketSelectorProps) 
     
     setLoading(true)
     try {
-      const res = await fetch(`http://localhost:8000/api/markets/active?market=${marketId}`, {
+      const res = await fetch(`/api/markets/active?market=${marketId}`, {
         method: 'POST'
       })
       if (res.ok) {

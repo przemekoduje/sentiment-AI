@@ -63,7 +63,7 @@ const Portfolio = () => {
   const fetchPortfolio = async () => {
     setLoading(true);
     try {
-      const res = await fetch('http://localhost:8000/api/portfolio');
+      const res = await fetch('/api/portfolio');
       const json = await res.json();
       setData(json);
       if (json.settings) {
@@ -78,7 +78,7 @@ const Portfolio = () => {
 
   const saveSettings = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/portfolio/settings', {
+      const res = await fetch('/api/portfolio/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(settings)
@@ -90,6 +90,27 @@ const Portfolio = () => {
       }
     } catch (err) {
       console.error("Failed to save settings:", err);
+    }
+  };
+
+  const handleEmergencyClose = async (ticker: string) => {
+    if (window.confirm(`DANGER: Are you sure you want to EMERGENCY CLOSE ${ticker}? This will immediately exit the position on the broker.`)) {
+      try {
+        const res = await fetch(`/api/portfolio/close?ticker=${ticker}`, {
+          method: 'POST'
+        });
+        
+        if (res.ok) {
+          alert(`Successfully closed ${ticker}.`);
+          fetchPortfolio(); // Refresh the list
+        } else {
+          const err = await res.json();
+          alert(`Failed to close position: ${err.detail || 'Unknown error'}`);
+        }
+      } catch (e) {
+        console.error("Emergency close error:", e);
+        alert("Failed to communicate with server for emergency close.");
+      }
     }
   };
 
@@ -230,15 +251,22 @@ const Portfolio = () => {
                 return (
                   <div key={i} className="group p-5 rounded-3xl bg-zinc-50 border border-zinc-100 hover:bg-white hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-50 transition-all duration-300">
                     <div className="flex items-center justify-between mb-4">
-                      <div className="flex items-center gap-4">
-                        <div className="w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center text-white text-lg font-black shadow-lg shadow-indigo-100 border border-indigo-400/20">
-                          {ticker}
+                        <div className="flex items-center gap-4">
+                          <div className="w-14 h-14 rounded-2xl bg-indigo-600 flex items-center justify-center text-white text-lg font-black shadow-lg shadow-indigo-100 border border-indigo-400/20 relative group">
+                            {ticker}
+                            <button 
+                              onClick={() => handleEmergencyClose(ticker)}
+                              className="absolute -top-2 -right-2 w-6 h-6 bg-red-600 rounded-full flex items-center justify-center shadow-lg transform scale-0 group-hover:scale-100 transition-transform duration-200 hover:bg-red-700"
+                              title="Emergency Close"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5 text-white" />
+                            </button>
+                          </div>
+                          <div>
+                            <p className="text-lg font-black text-zinc-900">{ticker}</p>
+                            <p className="text-xs font-bold text-zinc-400 uppercase tracking-widest">Qty: {pos.qty} @ ${pos.entry_price.toFixed(2)}</p>
+                          </div>
                         </div>
-                        <div>
-                          <p className="text-lg font-black text-zinc-900">{ticker}</p>
-                          <p className="text-xs font-bold text-zinc-400 uppercase tracking-widest">Qty: {pos.qty} @ ${pos.entry_price.toFixed(2)}</p>
-                        </div>
-                      </div>
                       <div className="text-right">
                         <p className={`text-xl font-black flex items-center justify-end gap-1 text-emerald-600`}>
                           <ArrowUpRight className="w-5 h-5" />

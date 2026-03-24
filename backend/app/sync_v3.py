@@ -82,11 +82,12 @@ async def sync_all():
     
     # Update performance metrics first (Mock/Demo for the Simulator)
     now = int(datetime.now().timestamp())
-    equity_curve = [{"time": now - (i * 86400), "value": 1000 + i * 15 + random.uniform(0, 50)} for i in range(30)][::-1]
-    bench_curve = [{"time": now - (i * 86400), "value": 1000 + i * 8 + random.uniform(0, 20)} for i in range(30)][::-1]
+    # Generujemy krzywą rosnącą (od 1000 do ok 1400)
+    equity_curve = [{"time": now - (i * 86400), "value": 1400 - i * 15 + random.uniform(-20, 20)} for i in range(30)][::-1]
+    bench_curve = [{"time": now - (i * 86400), "value": 1200 - i * 8 + random.uniform(-10, 10)} for i in range(30)][::-1]
     
     update_system_performance(
-        metrics={"win_rate": 72.5, "profit_factor": 2.4, "max_dd": -8.2, "alpha": 14.5},
+        metrics={"win_rate": 72.5, "profit_factor": 2.4, "max_drawdown": 8.2, "expected_value": 14.5},
         equity_curve=equity_curve,
         benchmark_curve=bench_curve
     )

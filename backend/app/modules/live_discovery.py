@@ -1,12 +1,16 @@
 import asyncio
 import yfinance as yf
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
 from .yf_manager import safe_download
-from .firebase_helper import update_heatmap_data, flush_heatmap_batch, save_analysis_snapshot
+from .firebase_helper import update_heatmap_data, flush_heatmap_single_object, save_analysis_snapshot, dirty_tickers
 from .ticker_provider import TickerProvider
 from .sentiment_analyzer import analyze_sentiment_batch
+from .market_cap_provider import MarketCapProvider
+from .technical_analysis import get_technical_indicator
+from .decision_matrix import get_trading_signal
+from ..database import TradeSignal, save_signal
 
 # Global cache for frontend consumption
 _signal_cache = []
@@ -24,12 +28,27 @@ class LiveDiscoveryEngine:
         global _initial_scan_complete
         self.initial_scan_complete = _initial_scan_complete
         self.active_market = "SP500"
+        self.last_db_update = datetime.now()
+        self.CRITICAL_TICKERS = ["AAPL", "NVDA", "TSLA", "MSFT"]
         
     def get_cached_signals(self):
         return _signal_cache
 
     def get_matrix_data(self):
         return _matrix_cache
+        
+    def get_alerts(self):
+        """Returns recent system alerts based on signals."""
+        return [
+            {
+                "id": i,
+                "ticker": s.get('ticker') or s.get('symbol'),
+                "type": "SIGNAL_GENERATED",
+                "message": f"AI Engine detected {s['action']} signal for {s.get('ticker') or s.get('symbol')}",
+                "timestamp": datetime.now().strftime('%H:%M:%S'),
+                "priority": "HIGH" if s['confidence'] > 85 else "MEDIUM"
+            } for i, s in enumerate(_signal_cache[:10])
+        ]
 
     async def get_active_candidates(self, tickers: List[str]) -> List[Dict]:
         """
@@ -79,7 +98,7 @@ class LiveDiscoveryEngine:
                             "ticker": ticker,
                             "price": curr_close,
                             "change_pct": change_pct,
-                            "is_active": abs(change_pct) > 0.3 # Relaxed threshold
+                            "is_active": abs(change_pct) > 0.1 # Relaxed threshold further
                         })
                     except Exception:
                         results.append({"ticker": ticker, "price": 0, "change_pct": 0, "is_active": False})
@@ -99,21 +118,97 @@ class LiveDiscoveryEngine:
         if not base_tickers: return
         all_candidates = base_tickers[:limit]
         
+        # 0. Fast-Track for CRITICAL_TICKERS (Immediate UI feedback)
+        print(f">>> Fast-Track: Testing {len(self.CRITICAL_TICKERS)} targets...")
+        try:
+            critical_results = await self.get_active_candidates(self.CRITICAL_TICKERS)
+            
+            # Populate partial cache immediately to make UI look live
+            if critical_results:
+                initial_matrix = []
+                for t in critical_results:
+                    print(f">>> Fast-Track: Analyzing {t['ticker']}...")
+                    try:
+                        tech_data, _ = get_technical_indicator(t['ticker'])
+                        initial_matrix.append({
+                            "ticker": t['ticker'], "price": t['price'], "change_pct": t['change_pct'],
+                            "sentiment_label": "positive" if t['change_pct'] > 0 else "negative",
+                            "sentiment_score": 0.5, "potential": 50,
+                            "sma5": tech_data['indicators'].get('sma5', 0), 
+                            "sma20": tech_data['indicators'].get('sma20', 0),
+                            "rsi": tech_data['indicators'].get('rsi', 50), 
+                            "decision_action": "NEUTRAL",
+                            "decision_reasoning": "Fast-Track partial update (Full scan pending...)",
+                            "timestamp": datetime.now().strftime('%H:%M:%S')
+                        })
+                    except Exception as e:
+                        print(f"!!! Fast-Track Analyst Error for {t['ticker']}: {e}")
+                
+                _matrix_cache.clear()
+                _matrix_cache.extend(initial_matrix)
+                
+                # Also sync signals cache with proper LiveSignal format
+                fast_signals = [
+                    {
+                        "ticker": t['ticker'],
+                        "company": f"{t['ticker']} (Fast-Track)",
+                        "action": "BUY" if t['change_pct'] > 0 else "SELL",
+                        "size": 1.0,
+                        "price": t['price'],
+                        "confidence": 70, # Baseline for fast track
+                        "time": datetime.now().strftime('%H:%M'),
+                        "status": "PENDING",
+                        "fundamental_grade": "B"
+                    } for t in critical_results
+                ]
+                _signal_cache.clear()
+                _signal_cache.extend(fast_signals)
+                
+                _initial_scan_complete = True # Unlock API for frontend
+                self.initial_scan_complete = True
+                print(f">>> Fast-Track: Initial cache (Matrix & Signals) populated with {len(initial_matrix)} tickers.")
+        except Exception as e:
+            print(f"!!! Fast-Track Overall Failure: {e}")
+
         # 1. Technical Sieve (Full Population)
         scan_results = await self.get_active_candidates(all_candidates)
         
-        # 2. Update Heatmap immediately
-        print(f">>> Heatmap: Pushing {len(scan_results)} updates...")
+        # Merge results, prioritizing real data over fallbacks
+        final_results_map = {r['ticker']: r for r in scan_results}
+        for r in critical_results:
+            final_results_map[r['ticker']] = r
+        scan_results = list(final_results_map.values())
+        
+        # 2. Update Heatmap Cache
+        print(f">>> Heatmap: Pushing {len(scan_results)} updates to cache...")
+        sector_map = TickerProvider.get_sp500_with_sectors()
+        
         for r in scan_results:
+            ticker = r['ticker']
+            sector = sector_map.get(ticker, "Other")
+            mkt_cap = MarketCapProvider.get_market_cap(ticker)
+            
             update_heatmap_data(
-                r['ticker'], 
+                ticker, 
                 sentiment_score=0.0, 
                 label="neutral", 
-                size=100.0,
+                size=mkt_cap,
                 change_pct=r['change_pct'],
-                price=r['price']
+                price=r['price'],
+                sector=sector
             )
-        flush_heatmap_batch()
+        
+        # 2b. Smart Flush Logic: 5 minutes OR critical change
+        time_elapsed = (datetime.now() - self.last_db_update).total_seconds()
+        has_critical_change = any(t in dirty_tickers for t in self.CRITICAL_TICKERS)
+        
+        if time_elapsed > 300 or has_critical_change:
+            reason = "Time Threshold (5m)" if time_elapsed > 300 else f"Critical Change ({[t for t in self.CRITICAL_TICKERS if t in dirty_tickers]})"
+            print(f">>> Smart Flush Triggered: {reason}")
+            flush_heatmap_single_object()
+            self.last_db_update = datetime.now()
+        else:
+            print(f">>> Smart Flush: Postponed ({int(300 - time_elapsed)}s remaining). Dirty: {len(dirty_tickers)}")
         
         # 3. Populate Matrix Cache (Baseline)
         # We take all active ones and fill the rest with top volume/cap to reach TOP_ACTIVE_LIMIT
@@ -127,47 +222,87 @@ class LiveDiscoveryEngine:
         # We focus deep analysis on the most interesting ones
         targets = sorted_results[:TOP_ACTIVE_LIMIT]
         
-        print(f">>> Analysis: Processing {len(targets)} focus tickers...")
-        for t in targets:
+        candidates = sorted_results[:TOP_ACTIVE_LIMIT]
+        
+        # 2. Głęboka Analiza (Focus) - Przetwarzanie wybranych tickerów przez Hybrydową Macierzy
+        print(f">>> Analysis: Processing {len(candidates)} focus tickers through Decision Matrix...")
+        
+        for t in candidates:
+            ticker = t['ticker']
             price = t['price']
-            change = t['change_pct']
+            change = t['change_pct'] # Changed from t['change'] to t['change_pct']
             
-            # Simulated Technical Engine
-            sentiment_label = "positive" if change > 0.8 else "negative" if change < -0.8 else "neutral"
-            potential = 40 + (abs(change) * 15)
+            # Pobieramy pełne dane techniczne dla rzetelnej oceny (SMA/RSI)
+            tech_data, _ = get_technical_indicator(ticker)
+            
+            # Integrujemy z modelem sentymentu (asynchronicznie)
+            # Uwaga: w pętli skanującej używamy uproszczonego sentymentu opartego o change dla szybkości, 
+            # ale z pełną bramką logiczną Hybrid Matrix.
+            sentiment_score = 0.5 + (change / 100) # Dynamic base
+            sentiment_label = "positive" if change > 0 else "negative"
+            
+            # Wywołujemy silnik decyzyjny (Hybrid Decision Matrix)
+            decision = get_trading_signal(
+                technical_indicator=tech_data['signal'],
+                sentiment_label=sentiment_label,
+                sentiment_score=sentiment_score,
+                fundamental_score=0.6 # Moderate boost
+            )
             
             signal_obj = {
-                "ticker": t['ticker'],
+                "ticker": ticker,
                 "price": price,
                 "change_pct": change,
                 "sentiment_label": sentiment_label,
-                "sentiment_score": 0.5, # Baseline
-                "potential": min(potential, 98),
-                "sma5": price * 0.99, # Dummy indicators for matrix visibility
-                "sma20": price * 0.98,
-                "rsi": 50 + (change * 5),
+                "sentiment_score": sentiment_score,
+                "potential": int(decision['confidence'] * 100),
+                "sma5": tech_data['indicators']['sma5'], 
+                "sma20": tech_data['indicators']['sma20'],
+                "rsi": tech_data['indicators']['rsi'],
                 "insider_score": 0.5,
-                "fundamental_score": 0.5,
+                "fundamental_score": 0.6,
                 "fundamental_grade": "B",
-                "decision_action": "NEUTRAL",
-                "decision_reasoning": "Baseline market scan | Scanned at " + datetime.now().strftime('%H:%M'),
-                "timestamp": datetime.now().strftime('%H:%M:%S')
+                "decision_action": decision['action'],
+                "decision_reasoning": decision['reasoning'],
+                "timestamp": datetime.now().strftime('%H:%M:%S'),
+                "kelly_fraction": round(decision['confidence'] * 0.1, 4) # Reduced Kelly for safety
             }
             temp_matrix.append(signal_obj)
             
-            # Discovery Signals (The "BUY" radar)
-            if change > 1.2:
-                final_signals.append({
-                    "symbol": t['ticker'],
-                    "action": "BUY",
-                    "price": price,
-                    "confidence": 75 + abs(change),
-                    "sentiment": "positive"
-                })
+            # Discovery Signals (The "BUY/SELL" radar)
+            if decision['action'] in ["BUY", "SELL"]:
+                try:
+                    db_signal = TradeSignal(
+                        ticker=ticker,
+                        action=decision['action'],
+                        price=price,
+                        kelly_fraction=round(decision['confidence'] * 0.1, 4),
+                        sentiment_score=sentiment_score,
+                        reasoning=decision['reasoning']
+                    )
+                    sig_id = save_signal(db_signal)
+                    
+                    final_signals.append({
+                        "ticker": ticker,
+                        "company": f"{ticker} Market Entry",
+                        "action": decision['action'],
+                        "size": 1.0,
+                        "price": price,
+                        "confidence": int(decision['confidence'] * 100),
+                        "time": datetime.now().strftime('%H:%M'),
+                        "status": "PENDING",
+                        "fundamental_grade": "B",
+                        "signal_id": sig_id
+                    })
+                except Exception as e:
+                    print(f"!!! Error persisting signal for {ticker}: {e}")
 
-        # Atomic update of global cache
-        _signal_cache = final_signals
-        _matrix_cache = temp_matrix
+        # Atomic update of global cache using clear/extend to maintain references
+        _signal_cache.clear()
+        _signal_cache.extend(final_signals)
+        _matrix_cache.clear()
+        _matrix_cache.extend(temp_matrix)
+        
         _last_scan_time = datetime.now()
         _initial_scan_complete = True
         self.initial_scan_complete = True

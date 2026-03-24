@@ -96,7 +96,7 @@ export default function TradeChartPopup({
            if (backtestEnd) params.append('backtest_end', backtestEnd)
         }
 
-        const res = await fetch(`http://localhost:8000/api/chart/trade?${params.toString()}`)
+        const res = await fetch(`/api/chart/trade?${params.toString()}`)
         const result = await res.json()
         
         if (result.error) {
@@ -111,10 +111,29 @@ export default function TradeChartPopup({
           return
         }
 
-        const data = result.data.map((d: any) => ({
-          time: d.date as any, // Can be string (YYYY-MM-DD) or number (UNIX timestamp)
+        const sanitizeChartData = (raw: any[]) => {
+          const seen = new Set();
+          return raw
+            .map(d => ({
+              time: d.time as any,
+              value: d.value
+            }))
+            .filter(d => {
+              if (!d.time || seen.has(d.time)) return false;
+              seen.add(d.time);
+              return true;
+            })
+            .sort((a, b) => {
+              const tA = typeof a.time === 'number' ? a.time : new Date(a.time).getTime() / 1000;
+              const tB = typeof b.time === 'number' ? b.time : new Date(b.time).getTime() / 1000;
+              return tA - tB;
+            });
+        };
+
+        const mainData = sanitizeChartData(result.data.map((d: any) => ({
+          time: d.date,
           value: d.price
-        }))
+        })))
 
         // Create Chart
         const chart = createChart(chartContainerRef.current!, {
@@ -148,7 +167,7 @@ export default function TradeChartPopup({
           lineWidth: 2,
         })
 
-        areaSeries.setData(data)
+        areaSeries.setData(mainData)
 
         // Add Indicators (SMA5 / SMA20)
         const sma5Series = chart.addSeries(LineSeries, {
@@ -166,12 +185,12 @@ export default function TradeChartPopup({
             title: 'SMA 20'
         })
 
-        const sma5Data = result.data
+        const sma5Data = sanitizeChartData(result.data
             .filter((d: any) => d.sma5 !== null && d.sma5 !== undefined)
-            .map((d: any) => ({ time: d.date as any, value: d.sma5 }))
-        const sma20Data = result.data
+            .map((d: any) => ({ time: d.date as any, value: d.sma5 })))
+        const sma20Data = sanitizeChartData(result.data
             .filter((d: any) => d.sma20 !== null && d.sma20 !== undefined)
-            .map((d: any) => ({ time: d.date as any, value: d.sma20 }))
+            .map((d: any) => ({ time: d.date as any, value: d.sma20 })))
 
         sma5Series.setData(sma5Data)
         sma20Series.setData(sma20Data)

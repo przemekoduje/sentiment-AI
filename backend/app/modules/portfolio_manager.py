@@ -1,13 +1,41 @@
+from typing import Dict, List, Optional
+from datetime import datetime
+from sqlmodel import Session, select
+from .alpaca_manager import submit_order, close_position_on_broker
+from ..database import engine, Position, PortfolioSettings, TradeLog, get_portfolio_settings, update_portfolio_settings
+
 class PortfolioManager:
-    def __init__(self, initial_capital: float = 10000.0, risk_per_trade: float = 0.02):
+    def __init__(self, initial_capital: float = 10000.0):
+        """
+        Architecture v3: Database-backed Portfolio Manager.
+        Loads state from PostgreSQL on initialization.
+        """
         self.initial_capital = initial_capital
-        self.current_cash = initial_capital
-        self.risk_per_trade = risk_per_trade
-        self.positions = {} # ticker -> {qty, entry_price, entry_time, sl, tp}
-        self.equity_curve = []
-        self.trade_log = []
+        self.refresh_state()
+
+    def refresh_state(self):
+        settings = get_portfolio_settings()
+        # Prioritize DB values if available
+        if settings.initial_capital:
+            self.initial_capital = settings.initial_capital
+        
+        self.risk_per_trade = settings.risk_per_trade
+        self.current_cash = settings.current_cash
+        self.auto_pilot_enabled = settings.auto_pilot_enabled
+        
+        # Load positions from DB
+        with Session(engine) as session:
+            db_positions = session.exec(select(Position).where(Position.is_active == True)).all()
+            self.positions = {p.ticker: {
+                "qty": p.qty,
+                "entry_price": p.entry_price,
+                "entry_time": p.entry_time.isoformat(),
+                "sl": p.sl,
+                "tp": p.tp
+            } for p in db_positions}
 
     def get_financial_summary(self, current_prices: dict):
+        self.refresh_state() # Ensure sync with DB
         total_involved = 0
         total_unrealized_pnl = 0
         risk_exposure = 0
@@ -16,7 +44,6 @@ class PortfolioManager:
             price = current_prices.get(ticker, pos['entry_price'])
             total_involved += pos['qty'] * pos['entry_price']
             total_unrealized_pnl += (price - pos['entry_price']) * pos['qty']
-            # Risk is defined as the distance to SL
             risk_exposure += (pos['entry_price'] - pos['sl']) * pos['qty']
             
         return {
@@ -28,94 +55,100 @@ class PortfolioManager:
             "position_count": len(self.positions)
         }
 
-    def get_daily_advice(self, market_sentiment: float):
-        """Generates intelligence advice based on current exposure."""
-        if not self.positions:
-            if market_sentiment > 0.6:
-                return "Market sentiment is bullish. AI suggests scanning for high-confidence entries in S&P 500."
-            return "Market is neutral. Focus on defensive sectors or wait for clearer signals."
-            
-        advice = []
-        if len(self.positions) > 5:
-            advice.append("High diversification reached. Monitor SL levels closely to prevent global drawdown.")
-        
-        avg_pnl = sum((t['pnl'] for t in self.trade_log[-5:])) if self.trade_log else 0
-        if avg_pnl < 0:
-            advice.append("Recent performance dip detected. Recommend reducing position sizes (SL 2-3%) for new entries.")
-            
-        return " | ".join(advice) if advice else "Current positions are healthy. Sentiment backup is stable."
-
-    def calculate_position_size(self, ticker: str, entry_price: float, sl_pct: float):
-        """
-        Calculates quantity based on standard Money Management:
-        Allocation = (Current Capital * Risk Per Trade) / Stop Loss %
-        Example: $10,000 capital, 2% risk, 5% stop -> $4,000 position.
-        """
-        if sl_pct <= 0:
-            return 0
-            
-        risk_amount = self.initial_capital * self.risk_per_trade
-        allocation_usd = risk_amount / sl_pct
-        
-        # Check if we have enough cash for this allocation
+    def calculate_position_size(self, ticker: str, entry_price: float, sl_pct: float, kelly_fraction: float = 0.02):
+        from .risk_manager import risk_manager
+        if sl_pct <= 0: return 0
+        safe_kelly_fraction = risk_manager.get_adjusted_kelly(kelly_fraction)
+        allocation_usd = self.initial_capital * safe_kelly_fraction
         if allocation_usd > self.current_cash:
             allocation_usd = self.current_cash
-            
-        qty = int(allocation_usd / entry_price)
-        return qty
+        return int(allocation_usd / entry_price)
 
-    def open_position(self, ticker: str, entry_price: float, entry_time: str, sl: float, tp: float, sl_pct: float):
-        qty = self.calculate_position_size(ticker, entry_price, sl_pct)
-        if qty <= 0:
-            return False
+    async def open_position(self, ticker: str, entry_price: float, entry_time: str, sl: float, tp: float, sl_pct: float, kelly_fraction: float = 0.02):
+        qty = self.calculate_position_size(ticker, entry_price, sl_pct, kelly_fraction)
+        if qty <= 0: return False
             
+        # 1. Broker First (ACID)
+        success = await submit_order(ticker, qty, side="buy")
+        if not success: return False
+
+        # 2. DB Update
         total_cost = qty * entry_price
-        self.current_cash -= total_cost
-        self.positions[ticker] = {
-            "qty": qty,
-            "entry_price": entry_price,
-            "entry_time": entry_time,
-            "sl": sl,
-            "tp": tp
-        }
+        with Session(engine) as session:
+            # Create Position record
+            new_pos = Position(
+                ticker=ticker,
+                qty=qty,
+                entry_price=entry_price,
+                sl=sl,
+                tp=tp,
+                is_active=True
+            )
+            session.add(new_pos)
+            
+            # Update Cash in Settings
+            settings = session.get(PortfolioSettings, 1)
+            settings.current_cash -= total_cost
+            
+            session.commit()
+        
+        self.refresh_state()
         return True
 
-    def close_position(self, ticker: str, exit_price: float, exit_time: str, reason: str):
-        if ticker not in self.positions:
-            return False
+    async def close_position(self, ticker: str, exit_price: float, exit_time: str, reason: str):
+        """
+        Closes position with CONCURRENCY LOCK (FOR UPDATE) and BROKER FIRST policy.
+        """
+        with Session(engine) as session:
+            # 1. Lock the position row to prevent race conditions
+            statement = select(Position).where(Position.ticker == ticker, Position.is_active == True).with_for_update()
+            pos_record = session.exec(statement).first()
             
-        pos = self.positions[ticker]
-        total_value = pos['qty'] * exit_price
-        self.current_cash += total_value
-        
-        pnl = (exit_price - pos['entry_price']) * pos['qty']
-        pnl_pct = ((exit_price / pos['entry_price']) - 1) * 100
-        
-        self.trade_log.append({
-            "ticker": ticker,
-            "entry_time": pos['entry_time'],
-            "exit_time": exit_time,
-            "entry_price": round(pos['entry_price'], 2),
-            "exit_price": round(exit_price, 2),
-            "qty": pos['qty'],
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "reason": reason,
-            "sl": round(pos['sl'], 2),
-            "tp": round(pos['tp'], 2)
-        })
-        
-        del self.positions[ticker]
+            if not pos_record:
+                print(f"!!! Concurrency Alert: Position {ticker} already closing or closed.")
+                return False
+
+            # 2. Broker First Requirement
+            broker_success = await close_position_on_broker(ticker)
+            if not broker_success:
+                print(f"!!! Broker Error: Failed to liquidate {ticker} on Alpaca.")
+                return False
+
+            # 3. Update DB state
+            total_value = pos_record.qty * exit_price
+            pnl = (exit_price - pos_record.entry_price) * pos_record.qty
+            pnl_pct = ((exit_price / pos_record.entry_price) - 1) * 100
+            
+            # Record History
+            log = TradeLog(
+                ticker=ticker,
+                entry_time=pos_record.entry_time,
+                exit_time=datetime.utcnow(),
+                entry_price=pos_record.entry_price,
+                exit_price=exit_price,
+                qty=pos_record.qty,
+                pnl=pnl,
+                pnl_pct=pnl_pct,
+                reason=reason,
+                sl=pos_record.sl,
+                tp=pos_record.tp
+            )
+            session.add(log)
+            
+            # Update Cash
+            settings = session.get(PortfolioSettings, 1)
+            settings.current_cash += total_value
+            
+            # Remove Position (or mark inactive)
+            session.delete(pos_record)
+            
+            session.commit()
+            print(f"CLEANUP SUCCESS: {ticker} closed and persisted.")
+            
+        self.refresh_state()
         return True
 
     def update_equity(self, current_prices: dict, timestamp: str):
-        total_equity = self.current_cash
-        for ticker, pos in self.positions.items():
-            price = current_prices.get(ticker, pos['entry_price'])
-            total_equity += pos['qty'] * price
-            
-        self.equity_curve.append({
-            "date": timestamp,
-            "equity": round(total_equity, 2)
-        })
-        return total_equity
+        # We might want to persist equity_curve later, for now we derive it
+        summary = self.get_financial_summary(current_prices)
+        return summary['equity']

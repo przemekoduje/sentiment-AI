@@ -58,7 +58,7 @@ export default function MissionControl({ ticker: initialTicker = "AAPL" }: Missi
 
   const fetchAutoPilotStatus = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/autopilot')
+      const res = await fetch('/api/autopilot')
       const data = await res.json()
       setAutoPilot(data.enabled)
     } catch (err) {
@@ -69,7 +69,7 @@ export default function MissionControl({ ticker: initialTicker = "AAPL" }: Missi
   const fetchSignals = async (ticker: string) => {
     setLoading(true)
     try {
-      const res = await fetch(`http://localhost:8000/api/signals?ticker=${ticker}`)
+      const res = await fetch(`/api/signals?ticker=${ticker}`)
       if (!res.ok) throw new Error(`API Error: ${res.status}`)
       const data = await res.json()
       setSignals((prev) => {

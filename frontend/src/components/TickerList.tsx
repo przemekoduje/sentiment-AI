@@ -16,7 +16,7 @@ export default function TickerList({ onTickerSelect }: TickerListProps) {
 
   const fetchTickers = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/markets/tickers')
+      const res = await fetch('/api/markets/tickers')
       const data = await res.json()
       setTickers(data.tickers || [])
       setMarket(data.market || "")
