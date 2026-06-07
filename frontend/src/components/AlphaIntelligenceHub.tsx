@@ -2,22 +2,15 @@
 
 import React from 'react'
 import { 
-  Target, 
-  Map, 
-  TrendingUp,
-  Zap
+  Zap,
+  Brain
 } from 'lucide-react'
-import { 
-  Tabs, 
-  TabsContent, 
-  TabsList, 
-  TabsTrigger 
-} from '@/components/ui/tabs'
+import { cn } from '@/lib/utils'
 
 // Lazy-loaded visual components from the new architecture
 import MissionControlView from './MissionControlView'
-import SentimentHeatmap from './SentimentHeatmap'
-import KellySimulator from './KellySimulator'
+import RealTimeIntelCard from './RealTimeIntelCard'
+import VsaDeepAuditReport from './VsaDeepAuditReport'
 
 interface AlphaIntelligenceHubProps {
   ticker: string
@@ -25,62 +18,99 @@ interface AlphaIntelligenceHubProps {
 }
 
 export default function AlphaIntelligenceHub({ ticker, onTickerSelect }: AlphaIntelligenceHubProps) {
-  const [mounted, setMounted] = React.useState(false)
+  const [data, setData] = React.useState<any>(null)
+  const [loading, setLoading] = React.useState(false)
 
   React.useEffect(() => {
-    setMounted(true)
-  }, [])
+    async function fetchDeepAnalysis() {
+      setData(null) // Reset stale data
+      setLoading(true)
+      try {
+        const res = await fetch(`/api/intelligence/reasoning/${ticker}`)
+        if (res.ok) {
+          const detail = await res.json()
+          setData(detail)
+        }
+      } catch (err) {
+        console.error("Failed to fetch deep analysis:", err)
+      } finally {
+        setLoading(false)
+      }
+    }
 
-  if (!mounted) {
-    return (
-      <div className="space-y-8 animate-in fade-in duration-700 min-h-[600px]">
-        <div className="h-12 bg-zinc-100/50 rounded-2xl border border-zinc-100 animate-pulse w-96 mb-8" />
-        <div className="bg-white rounded-[32px] border border-zinc-100 p-12 min-h-[400px] animate-pulse" />
-      </div>
-    )
-  }
+    if (ticker) {
+      fetchDeepAnalysis()
+    }
+  }, [ticker])
 
   return (
-    <div className="space-y-8 animate-in fade-in duration-700">
-      <Tabs defaultValue="mission-control" className="space-y-8">
-        <div className="flex items-center justify-between mb-2">
-          <TabsList className="bg-zinc-100/50 p-1.5 rounded-2xl border border-zinc-100">
-            <TabsTrigger value="mission-control" className="gap-2">
-              <Target className="w-4 h-4" />
-              Mission Control
-            </TabsTrigger>
-            <TabsTrigger value="heatmap" className="gap-2">
-              <Map className="w-4 h-4" />
-              S&P 500 Heatmap
-            </TabsTrigger>
-            <TabsTrigger value="simulator" className="gap-2">
-              <TrendingUp className="w-4 h-4" />
-              Kelly Simulator
-            </TabsTrigger>
-          </TabsList>
+    <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-1000">
+      {/* Top Section: Real-time Intel Header */}
+      <RealTimeIntelCard 
+        ticker={ticker}
+        onTickerChange={onTickerSelect}
+        price={data?.quant?.current_price || "---"}
+        change={data?.quant?.change_pct || 0}
+        signal={data?.decision?.recommendation}
+        sentiment={data?.quant?.sentiment_label || "NEUTRAL"}
+      />
 
-          <div className="flex items-center gap-3">
-             <div className="px-4 py-2 bg-indigo-50 rounded-xl border border-indigo-100">
-                <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest flex items-center gap-2">
-                  <Zap className="w-3 h-3 fill-indigo-600" />
-                  Fast-Path Enabled
-                </span>
-             </div>
-          </div>
+      {/* Narrative Section: VSA Deep Research */}
+      <div className="w-full">
+        {/* Ticker Selector Bar (Top 10 Key Companies) */}
+        <div className="flex flex-wrap gap-2 mb-8 bg-zinc-100/50 p-2 rounded-2xl border border-zinc-200">
+          {["TSLA", "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "AMD", "PLTR", "MSTR"].map(t => (
+            <button
+              key={t}
+              onClick={() => onTickerSelect(t)}
+              className={cn(
+                "px-4 py-2 rounded-xl text-[10px] font-black tracking-widest uppercase transition-all",
+                ticker === t 
+                  ? "bg-zinc-900 text-white shadow-lg shadow-zinc-200 scale-105" 
+                  : "text-zinc-400 hover:text-zinc-600 hover:bg-zinc-200/50"
+              )}
+            >
+              {t}
+            </button>
+          ))}
+          <div className="h-8 w-px bg-zinc-200 mx-2" />
+          <input 
+            type="text"
+            placeholder="Search..."
+            className="bg-transparent border-none focus:outline-none text-[10px] font-bold uppercase w-20 px-2"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                onTickerSelect((e.target as HTMLInputElement).value.toUpperCase())
+                ;(e.target as HTMLInputElement).value = ""
+              }
+            }}
+          />
         </div>
 
-        <TabsContent value="mission-control" className="mt-0 focus-visible:ring-0">
-           <MissionControlView ticker={ticker} />
-        </TabsContent>
+        <header className="flex items-center gap-4 mb-10 pl-2">
+            <div className="bg-zinc-900 p-2 rounded-xl">
+                <Brain className="w-5 h-5 text-white" />
+            </div>
+            <div>
+                <h3 className="text-sm font-black text-zinc-900 uppercase tracking-[0.2em]">Institutional Lens v2.5</h3>
+                <div className="flex items-center gap-2">
+                    <p className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Głęboka Analiza Systemowa (VSA & Wyckoff Logic)</p>
+                    <div className="h-3 w-px bg-zinc-200 mx-1" />
+                    <span className="text-[8px] font-black bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded uppercase tracking-tighter border border-blue-100">
+                        Bidirectional Strategy Mandate
+                    </span>
+                </div>
+            </div>
+        </header>
 
-        <TabsContent value="heatmap" className="mt-0 focus-visible:ring-0">
-           <SentimentHeatmap onTickerSelect={onTickerSelect} />
-        </TabsContent>
-
-        <TabsContent value="simulator" className="mt-0 focus-visible:ring-0">
-           <KellySimulator />
-        </TabsContent>
-      </Tabs>
+        <VsaDeepAuditReport 
+          ticker={ticker}
+          analysisText={data?.deep_analysis} 
+          ohlcv={data?.ohlcv}
+          anomalies={data?.structural}
+          loading={loading}
+        />
+      </div>
     </div>
   )
 }

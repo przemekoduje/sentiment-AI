@@ -23,9 +23,11 @@ import {
   Brain,
   Lock,
   ShieldCheck,
-  ShieldAlert
+  ShieldAlert,
+  SearchCode
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import VsaAnalysisModal from './VsaAnalysisModal'
 
 interface LiveSignal {
   ticker: string
@@ -73,6 +75,10 @@ export default function DiscoveryRadar({
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [manualTicker, setManualTicker] = useState('')
   const [manualAction, setManualAction] = useState<'BUY' | 'SELL'>('BUY')
+
+  // VSA Modal state
+  const [isVsaModalOpen, setIsVsaModalOpen] = useState(false)
+  const [vsaTicker, setVsaTicker] = useState('')
 
   const fetchDiscovery = async () => {
     if (loading && !signals.length) setLoading(true)
@@ -639,6 +645,21 @@ export default function DiscoveryRadar({
                           >
                             <X className="w-4 h-4" />
                           </button>
+
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setVsaTicker(signal.ticker)
+                              setIsVsaModalOpen(true)
+                            }}
+                            className="bg-zinc-900 hover:bg-black text-white p-1.5 rounded-lg border border-zinc-800 transition-all active:scale-95 shadow-sm group relative"
+                            title="VSA Insight"
+                          >
+                            <SearchCode className="w-4 h-4" />
+                            <span className="absolute -top-10 left-1/2 -translate-x-1/2 bg-zinc-900 text-white text-[8px] px-2 py-1 rounded opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity font-black uppercase tracking-widest border border-white/10">
+                              VSA_INSIGHT
+                            </span>
+                          </button>
                          </div>
                       )}
 
@@ -810,6 +831,11 @@ export default function DiscoveryRadar({
            </div>
          )}
        </AnimatePresence>
+        <VsaAnalysisModal 
+          ticker={vsaTicker}
+          isOpen={isVsaModalOpen}
+          onClose={() => setIsVsaModalOpen(false)}
+        />
     </div>
   )
 }

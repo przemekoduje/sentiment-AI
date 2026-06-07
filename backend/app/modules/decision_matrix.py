@@ -52,9 +52,13 @@ def get_trading_signal(technical_indicator: str, sentiment_label: str, sentiment
     if fundamental_score > 0.7:
         reasoning.append("Quality: High Moat business grade (+10% Conf).")
 
+    # Safety Guard: Ensure confidence is zeroed if no clear direction is established
+    if decision == "HOLD":
+        confidence = 0.0
+
     return {
         "action": decision,
         "reasoning": " | ".join(reasoning),
         "is_confident": confidence > 0.6,
-        "confidence": confidence
+        "confidence": round(confidence, 4)
     }

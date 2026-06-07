@@ -11,6 +11,7 @@ import LiveDecisionMatrix from './LiveDecisionMatrix'
 import MarketInsight from './MarketInsight'
 import Portfolio from './Portfolio'
 import Alerts from './Alerts'
+import StrategyAuditor from './StrategyAuditor'
 
 import AlphaIntelligenceHub from './AlphaIntelligenceHub'
 
@@ -127,9 +128,9 @@ export default function MainLayout() {
             <MarketInsight ticker={activeTicker} onTickerChange={handleNavigateToInsight} />
           )}
 
-          {activeTab === 'analytics' && (
+          {/* {activeTab === 'analytics' && (
             <AIReasoningPanel />
-          )}
+          )} */}
           
           {activeTab === 'lab' && (
             <div className="max-w-6xl mx-auto">
@@ -150,6 +151,14 @@ export default function MainLayout() {
           {activeTab === 'alerts' && (
             <Alerts onTickerNavigate={handleNavigateToInsight} />
           )}
+
+          {activeTab === 'mission' && (
+            <MissionControl />
+          )}
+
+          {/* {activeTab === 'auditor' && (
+            <StrategyAuditor ticker={activeTicker} onTickerChange={setActiveTicker} />
+          )} */}
         </main>
       </div>
     </div>

@@ -10,7 +10,8 @@ import {
   HelpCircle,
   BarChart2,
   Bell,
-  Activity
+  Activity,
+  Search
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -26,10 +27,12 @@ const navItems = [
   { id: 'overview', label: 'Intelligence Hub', icon: Brain },
   { id: 'discovery', label: 'Live Discovery', icon: Zap },
   { id: 'insight', label: 'Asset Analysis', icon: BarChart2 },
-  { id: 'analytics', label: 'Market Metrics', icon: Activity },
+  // { id: 'analytics', label: 'Market Metrics', icon: Activity },
   { id: 'active', label: 'Active Portfolio', icon: Briefcase },
+  { id: 'mission', label: 'Mission Control', icon: Zap },
   { id: 'alerts', label: 'Market Alerts', icon: Bell },
   { id: 'lab', label: 'Strategy Lab', icon: FlaskConical },
+  // { id: 'auditor', label: 'VSA Auditor', icon: Search },
 ]
 
 export default function Sidebar({ 

@@ -43,12 +43,17 @@ class RiskManager:
     def __init__(self):
         self.geo_engine = GeoEngine()
         
-    def get_adjusted_kelly(self, raw_kelly: float) -> float:
+    def get_adjusted_kelly(self, raw_kelly: float, confidence: float = 1.0) -> float:
         """
         Applies GeoAI penalty and Safety Caps to the raw Kelly fraction.
+        Enforces Half-Kelly (0.5x) for sub-0.8 confidence signals.
         """
         geo_mult = self.geo_engine.sync_global_risk()
-        adjusted = raw_kelly * geo_mult
+        
+        # Phase 15: Half-Kelly Enforcement
+        safety_multiplier = 0.5 if confidence < 0.8 else 1.0
+        
+        adjusted = raw_kelly * geo_mult * safety_multiplier
         
         # Architecture v2 - Hard Safety Cap at 10%
         final_kelly = min(adjusted, 0.10)

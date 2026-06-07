@@ -55,17 +55,30 @@ class PortfolioManager:
             "position_count": len(self.positions)
         }
 
-    def calculate_position_size(self, ticker: str, entry_price: float, sl_pct: float, kelly_fraction: float = 0.02):
+    def calculate_position_size(self, ticker: str, entry_price: float, sl_pct: float, confidence: float = 1.0, kelly_fraction: float = 0.02):
         from .risk_manager import risk_manager
         if sl_pct <= 0: return 0
-        safe_kelly_fraction = risk_manager.get_adjusted_kelly(kelly_fraction)
+        safe_kelly_fraction = risk_manager.get_adjusted_kelly(kelly_fraction, confidence=confidence)
+        
+        # Determine target allocation in USD
         allocation_usd = self.initial_capital * safe_kelly_fraction
+        
+        # Ensure we don't exceed current cash
         if allocation_usd > self.current_cash:
             allocation_usd = self.current_cash
-        return int(allocation_usd / entry_price)
+            
+        qty = int(allocation_usd / entry_price)
+        
+        if qty == 0 and self.current_cash >= entry_price:
+            max_safety_usd = self.initial_capital * 0.10 # 10% Hard Cap
+            if entry_price <= max_safety_usd:
+                print(f"RISK ADAPTATION: Minimum 1 share rule triggered for {ticker} (${entry_price})")
+                qty = 1
+                
+        return qty
 
-    async def open_position(self, ticker: str, entry_price: float, entry_time: str, sl: float, tp: float, sl_pct: float, kelly_fraction: float = 0.02):
-        qty = self.calculate_position_size(ticker, entry_price, sl_pct, kelly_fraction)
+    async def open_position(self, ticker: str, entry_price: float, entry_time: str, sl: float, tp: float, sl_pct: float, confidence: float = 1.0, kelly_fraction: float = 0.02):
+        qty = self.calculate_position_size(ticker, entry_price, sl_pct, confidence, kelly_fraction)
         if qty <= 0: return False
             
         # 1. Broker First (ACID)

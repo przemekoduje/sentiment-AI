@@ -272,13 +272,35 @@ class LiveDiscoveryEngine:
             # Discovery Signals (The "BUY/SELL" radar)
             if decision['action'] in ["BUY", "SELL"]:
                 try:
+                    # Stage 16: VSA Hard Gate
+                    from .vsa.pipeline import VSAMacroPipeline
+                    vsa_res = await VSAMacroPipeline.process_instrument(ticker, render_chart=False)
+                    vsa_bias = vsa_res.get('recommendation', 'HOLD')
+                    vsa_reason = vsa_res.get('reasoning', '')
+                    
+                    is_blocked = False
+                    if decision['action'] == "BUY" and vsa_bias == "SELL":
+                        is_blocked = True
+                    elif decision['action'] == "SELL" and vsa_bias == "BUY":
+                        is_blocked = True
+                    
+                    if is_blocked:
+                        print(f">>> [BLOCKED BY VSA MACRO BIAS] {ticker}: AI={decision['action']} vs VSA={vsa_bias}")
+                        decision['action'] = "SKIP"
+                        decision['reasoning'] = f"[BLOCKED BY VSA MACRO BIAS] VSA conflict ({vsa_bias}). {vsa_reason}"
+                    
+                    signal_obj['vsa_macro_bias'] = vsa_bias
+                    signal_obj['vsa_reasoning'] = vsa_reason
+
                     db_signal = TradeSignal(
                         ticker=ticker,
                         action=decision['action'],
                         price=price,
                         kelly_fraction=round(decision['confidence'] * 0.1, 4),
                         sentiment_score=sentiment_score,
-                        reasoning=decision['reasoning']
+                        reasoning=decision['reasoning'],
+                        vsa_macro_bias=vsa_bias,
+                        vsa_reasoning=vsa_reason
                     )
                     sig_id = save_signal(db_signal)
                     

@@ -1,7 +1,9 @@
 import os
+import asyncio
 import traceback
 from typing import Optional
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
 import uvicorn
@@ -27,6 +29,7 @@ from pydantic import BaseModel
 from .modules.yf_manager import safe_download
 import asyncio
 import math
+from typing import List
 
 def sanitize_nan(obj, fallback=0.0):
     """Recursively replaces NaN/Inf with fallback in dicts, lists, and floats."""
@@ -705,6 +708,11 @@ class TradeRequest(BaseModel):
     tp_pct: float = 0.10
     signal_id: Optional[int] = None # Zero Trust identification
 
+class ChatRequest(BaseModel):
+    ticker: str
+    message: str
+    history: List[dict] = []
+
 @app.post("/api/live/execute")
 async def execute_manual_trade(req: TradeRequest):
     """
@@ -758,6 +766,282 @@ async def update_portfolio_settings_endpoint(settings: PortfolioSettings):
     portfolio.refresh_state()
     return {"status": "success", "settings": settings}
 
+
+@app.get("/api/vsa/analysis/{ticker}")
+async def get_vsa_analysis(ticker: str, interval: str = "1d"):
+    """
+    Triggers the 3-stage VSA Macro Engine for a specific ticker.
+    Returns quantitative metrics, structural validation, and final trading plan.
+    """
+    from .modules.vsa.pipeline import VSAMacroPipeline
+    try:
+        result = await VSAMacroPipeline.process_instrument(ticker, interval, limit_recent=True, plot_length=60)
+        return sanitize_nan(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vsa/audit/{ticker}")
+async def get_vsa_audit(ticker: str, interval: str = "1d", plot_length: int = 150):
+    """
+    Historical VSA Audit: Processes full dataset and returns a longer chart.
+    Useful for visual backtesting and strategy verification.
+    """
+    from .modules.vsa.pipeline import VSAMacroPipeline
+    try:
+        # force_refresh=True to avoid cache and get fresh audit trail
+        result = await VSAMacroPipeline.process_instrument(
+            ticker, interval, render_chart=True, force_refresh=True, limit_recent=False, plot_length=plot_length
+        )
+        return sanitize_nan(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Removed duplicated block during cleanup
+
+@app.get("/api/risk/status")
+async def get_risk_status():
+    """
+    Returns active positions with real-time ROI and VSA bias.
+    """
+    from .database import get_active_positions, get_vsa_cache
+    try:
+        positions = await asyncio.to_thread(get_active_positions)
+        results = []
+        
+        # Get latest prices for ROI calculation
+        cached_matrix = discovery_engine.get_matrix_data()
+        price_map = {item['ticker']: item['price'] for item in cached_matrix}
+        
+        for pos in positions:
+            current_price = price_map.get(pos.ticker, pos.entry_price)
+            roi = ((current_price - pos.entry_price) / pos.entry_price) * 100
+            
+            # Get VSA bias from cache
+            vsa_data = get_vsa_cache(pos.ticker)
+            vsa_bias = vsa_data.get('recommendation', 'NEUTRAL') if vsa_data else "NO_DATA"
+            
+            results.append({
+                "id": pos.id,
+                "ticker": pos.ticker,
+                "qty": pos.qty,
+                "entry_price": pos.entry_price,
+                "current_price": current_price,
+                "roi": roi,
+                "vsa_bias": vsa_bias,
+                "sl": pos.sl,
+                "tp": pos.tp,
+                "entry_time": pos.entry_time.isoformat()
+            })
+            
+        return sanitize_nan(results)
+    except Exception as e:
+        print(f"Error in /api/risk/status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/intelligence/reasoning/{ticker}")
+async def get_vsa_reasoning(ticker: str):
+    """
+    Returns detailed 3-stage VSA logic for a ticker from cache.
+    Includes deep Polish descriptive analysis.
+    """
+    from .database import get_vsa_cache, save_vsa_cache
+    from .modules.vsa.deep_reasoning import VSADeepReasoningEngine
+    deep_engine = VSADeepReasoningEngine()
+    
+    try:
+        vsa_data = get_vsa_cache(ticker)
+        has_today_analysis = False
+        deep_analysis = ""
+        
+        if vsa_data and vsa_data.get('deep_analysis'):
+            # Check if cache is from TODAY (UTC)
+            cache_ts = vsa_data.get('timestamp')
+            if cache_ts and cache_ts.date() == datetime.utcnow().date():
+                has_today_analysis = True
+                deep_analysis = vsa_data['deep_analysis']
+
+        if not vsa_data:
+            from .modules.vsa.pipeline import VSAMacroPipeline
+            vsa_data = await VSAMacroPipeline.process_instrument(ticker, limit_recent=True)
+        
+        # Guard: If analysis failed, return error immediately
+        if "error" in vsa_data:
+            return sanitize_nan({
+                "ticker": ticker,
+                "error": vsa_data["error"],
+                "decision": {
+                    "recommendation": "ERROR",
+                    "reasoning": vsa_data["error"],
+                    "plan": None
+                }
+            })
+        
+        # Defensive Check: Ensure ohlcv is present even if retrieved from an older cache entry
+        if not vsa_data.get('ohlcv'):
+            from .modules.vsa.data_router import VSADataRouter
+            import pandas as pd
+            df = await VSADataRouter.get_ohlcv(ticker)
+            if not df.empty:
+                ohlcv_list = []
+                for idx, row in df.iterrows():
+                    ohlcv_list.append({
+                        "time": idx.strftime("%Y-%m-%d"),
+                        "open": float(row['Open']),
+                        "high": float(row['High']),
+                        "low": float(row['Low']),
+                        "close": float(row['Close']),
+                        "volume": float(row['Volume'])
+                    })
+                vsa_data['ohlcv'] = ohlcv_list
+                # Update cache to include missing ohlcv
+                save_vsa_cache(vsa_data)
+            
+        if not has_today_analysis:
+            # Generate Deep Polish Analysis
+            deep_analysis = await asyncio.to_thread(
+                deep_engine.generate_polish_analysis,
+                ticker,
+                vsa_data.get('vsa_metrics', {}),
+                vsa_data.get('anomalies', []),
+                vsa_data.get('phase', 'UNKNOWN'),
+                vsa_data.get('blocks', [])
+            )
+            # Update cache with the new deep analysis
+            vsa_data['deep_analysis'] = deep_analysis
+            save_vsa_cache(vsa_data)
+            
+        # Global cleanup for deep_analysis to Ensure no Markdown symbols are returned
+        import re
+        clean_analysis = re.sub(r'[#*]+', '', deep_analysis or "")
+        clean_analysis = re.sub(r' +', ' ', clean_analysis).strip()
+        
+        # Hard Fallback for missing Price/Change in quant object
+        quant = vsa_data.get('vsa_metrics', {})
+        ohlcv = vsa_data.get('ohlcv', [])
+        if ohlcv and len(ohlcv) >= 1:
+            if not quant.get('current_price'):
+                cur = float(ohlcv[-1].get('close', 0))
+                prev = float(ohlcv[-2].get('close', cur)) if len(ohlcv) > 1 else cur
+                quant['current_price'] = round(cur, 2)
+                quant['change_pct'] = round(((cur - prev) / prev) * 100, 2) if prev > 0 else 0
+
+        return sanitize_nan({
+            "ticker": ticker,
+            "quant": quant,
+            "structural": vsa_data.get('anomalies', []),
+            "deep_analysis": clean_analysis,
+            "chart_base64": vsa_data.get('chart_base64'),
+            "ohlcv": ohlcv,
+            "decision": {
+                "recommendation": vsa_data.get('recommendation', 'HOLD'),
+                "reasoning": vsa_data.get('reasoning', ''),
+                "plan": vsa_data.get('trading_plan')
+            }
+        })
+    except Exception as e:
+        print(f"Error in /api/intelligence/reasoning/{ticker}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/intelligence/chat")
+async def vsa_chat(request: ChatRequest):
+    """
+    Context-aware VSA Chat: Allows follow-up questions using the latest VSA data.
+    Supports real-time streaming for a premium experience.
+    """
+    from .database import get_vsa_cache
+    from .modules.vsa.pipeline import VSAMacroPipeline
+    import json
+    
+    try:
+        # 1. Get VSA Context for the Ticker
+        vsa_data = get_vsa_cache(request.ticker)
+        if not vsa_data:
+             vsa_data = await VSAMacroPipeline.process_instrument(request.ticker, limit_recent=True)
+        
+        # 2. Build Context-Rich System Prompt
+        metrics = vsa_data.get('vsa_metrics', {})
+        anomalies = vsa_data.get('anomalies', [])
+        phase = vsa_data.get('phase', 'UNKNOWN')
+        
+        context_str = f"WALOR: {request.ticker}\nFAZA: {phase}\nMETRYKI: {metrics}\nANOMALIE: {anomalies[-5:] if anomalies else 'BRAK'}"
+        
+        system_prompt = f"""
+        Jesteś ekspertem VSA (Volume Spread Analysis) w systemie Strategic Command. 
+        Udzielasz profesjonalnych odpowiedzi na pytania dotyczące waloru {request.ticker}.
+        
+        KONTEKST:
+        {context_str}
+        
+        ZASADY:
+        1. ODPOWIADAJ PO POLSKU.
+        2. Używaj terminologii VSA.
+        3. MOŻESZ używać Markdown (pogrubienia, listy) dla przejrzystości.
+        4. Ton profesjonalny i analityczny.
+        5. Jeśli użytkownik zapyta o konkrety, odwołuj się do powyższych metryk.
+        """
+        
+        async def event_generator():
+            try:
+                # 3. Choose Provider (Gemini or OpenAI)
+                google_key = os.getenv("GOOGLE_API_KEY")
+                openai_key = os.getenv("OPENAI_API_KEY")
+
+                if google_key:
+                    import google.generativeai as genai
+                    genai.configure(api_key=google_key)
+                    model = genai.GenerativeModel('gemini-2.0-flash')
+                    
+                    # Convert history for Gemini
+                    # (Simplified for now - strictly system + user message)
+                    full_prompt = f"{system_prompt}\n\nHISTORIA CZATU:\n"
+                    for h in request.history[-5:]:
+                        role = "User" if h['role'] == 'user' else "Assistant"
+                        full_prompt += f"{role}: {h['content']}\n"
+                    full_prompt += f"User: {request.message}"
+                    
+                    response = await asyncio.to_thread(
+                        model.generate_content, 
+                        full_prompt,
+                        stream=True
+                    )
+                    
+                    for chunk in response:
+                        if chunk.text:
+                            yield f"data: {json.dumps({'content': chunk.text})}\n\n"
+                
+                elif openai_key:
+                    from openai import AsyncOpenAI
+                    client = AsyncOpenAI(api_key=openai_key)
+                    
+                    messages = [{"role": "system", "content": system_prompt}]
+                    for msg in request.history[-5:]:
+                        messages.append(msg)
+                    messages.append({"role": "user", "content": request.message})
+                    
+                    stream = await client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=messages,
+                        temperature=0.3,
+                        stream=True
+                    )
+                    
+                    async for chunk in stream:
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            yield f"data: {json.dumps({'content': content})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'error': 'No API Key configured'})}\n\n"
+                    
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    except Exception as e:
+        print(f"Chat Setup Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
